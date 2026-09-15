@@ -40,6 +40,26 @@ export interface SubdomainInfo {
   status: string;
   expires_at?: string;
   created_at?: string;
+  disable_ns_management?: boolean | number;
+  has_dns?: boolean | number;
+  ns1?: string;
+  ns2?: string;
+  /**
+   * 该域名所在的解析服务商账号 ID —— `subdomains/list` 不传 fields 时默认就返回，
+   * 无需额外调用。
+   *
+   * NOTE: 「域名是否支持按线路（运营商/地域）解析」在 API 里无从查起 —— 文档没有
+   * 任何线路能力字段（`fields` 参数枚举了子域名的全部可选字段，里面没有），也没有
+   * 根域名列表或 capability 接口；官网自己也是把「目前只有 us.ci 与 cn.mt 支持」
+   * 写死在文案里的。实测同一账号下 us.ci / cn.mt 的该值为 1，其余 7 个根域名为
+   * 7 或 8，两组取值无交集。
+   *
+   * 但文档从未说明这个字段的语义，属实测相关性而非契约。现已改用根域名的 NS 记录
+   * 作为主判定信号（见 `/api/dns/ns` 与前端 DNSHE_LINE_NS_SUFFIXES）—— NS 落在
+   * vip*.alidns.com 的根域支持线路，落在 DNSHE 自建 NS 的不支持，语义比裸数字明确
+   * 得多。本字段降级为 NS 查不到时的兜底信号，前端不再提供对应的可编辑名单。
+   */
+  provider_account_id?: number | string | null;
 }
 
 /** 子域名详情响应 */
@@ -60,7 +80,8 @@ export interface ListDnsRecordsResponse extends BaseResponse {
 
 /** DNS 记录信息 */
 export interface DnsRecordInfo {
-  id: number;
+  // Cloudflare 的记录 id 是 32 位十六进制字符串，DNSHE 是数字，统一放宽为联合类型
+  id: number | string;
   record_id?: string;
   name: string;
   type: string;
@@ -261,8 +282,11 @@ export class DNSHEClient {
 
   /**
    * 列出子域名的 DNS 解析记录
+   *
+   * NOTE: 参数放宽为 number | string —— 路由层对 DNSHE / Cloudflare 客户端做联合分发时
+   * 传同一个 remote_id（DNSHE 行是数字主键，CF 行是 zone id 字符串），实际只走数字。
    */
-  async listDnsRecords(subdomainId: number): Promise<ListDnsRecordsResponse> {
+  async listDnsRecords(subdomainId: number | string): Promise<ListDnsRecordsResponse> {
     return this.request<ListDnsRecordsResponse>("dns_records", "list", "GET", {
       subdomain_id: subdomainId
     });
@@ -277,15 +301,27 @@ export class DNSHEClient {
 
   /**
    * 修改 DNS 解析记录
+   *
+   * NOTE: 与删除接口一致 —— 记录标识为纯数字时同时以内部 id 和 record_id 两种
+   * 形式下发，兼容上游对两种字段的不同要求。
    */
   async updateDnsRecord(params: UpdateDnsRecordParams): Promise<ActionResponse> {
-    return this.request<ActionResponse>("dns_records", "update", "POST", params as unknown as Record<string, unknown>);
+    const payload: Record<string, unknown> = { ...params };
+    const numId = Number(params.record_id);
+    if (!isNaN(numId) && numId > 0) {
+      payload.id = numId;
+    }
+    payload.record_id = String(params.record_id);
+
+    return this.request<ActionResponse>("dns_records", "update", "POST", payload);
   }
 
   /**
    * 删除 DNS 解析记录
+   *
+   * NOTE: subdomainId 放宽为 number | string，理由同 listDnsRecords。
    */
-  async deleteDnsRecord(subdomainId: number, recordId: string | number): Promise<ActionResponse> {
+  async deleteDnsRecord(subdomainId: number | string, recordId: string | number): Promise<ActionResponse> {
     const params: Record<string, unknown> = {
       subdomain_id: subdomainId
     };

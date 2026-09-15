@@ -1,4 +1,20 @@
 import { DNSHEClient } from "./dnshe";
+import { CloudflareClient } from "./cloudflare";
+
+/** 绑定账号的提供商 */
+export type AccountProvider = "dnshe" | "cloudflare";
+
+/**
+ * 归一化自动解析出的 Cloudflare 账号别名
+ *
+ * NOTE: Cloudflare 给个人账号生成的默认名是「<邮箱>'s Account」，后缀是界面噪音，
+ * 自动命名时直接去掉（如 Lioil@nmail.art's Account → Lioil@nmail.art）；
+ * 账号名本身没有该后缀、或剥掉后为空时保持原样。用户显式填写的别名不经过这里。
+ */
+function normalizeCfAlias(name: string): string {
+  const stripped = String(name || "").replace(/\s*'s\s+account$/i, "").trim();
+  return stripped || String(name || "").trim();
+}
 
 /**
  * 导入 Crypto 工具以处理 AES 加密
@@ -121,6 +137,17 @@ export function timingSafeEqual(a: string, b: string): boolean {
   return result === 0;
 }
 
+/**
+ * 计算 SHA-256 十六进制摘要
+ *
+ * NOTE: 会话 token 落库前先哈希再存 —— 即使 D1 被读出，
+ *       攻击者也拿不到可用于重放在线会话的原始 token。
+ */
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 /** 鉴权配置（读取后的解密/明文形态） */
 export interface AuthConfig {
   username: string;
@@ -135,6 +162,7 @@ export interface DBAccount {
   id: number;
   alias: string;
   api_key: string;
+  provider: AccountProvider;
   created_at: string;
 }
 
@@ -150,6 +178,11 @@ export interface DBDomain {
   expires_at: string;
   last_renewed_at: string | null;
   has_dns?: number;
+  dns_provider?: string | null;
+  /** 解析服务商账号 ID，用于判断该域名是否支持按线路解析（见 dnshe.ts 的字段注释） */
+  provider_account_id?: string | null;
+  /** 上游对象 ID：Cloudflare 行存 zone id；DNSHE 行为空，主键 id 即 subdomain_id */
+  remote_id?: string | null;
   updated_at: string;
 }
 
@@ -163,8 +196,43 @@ export interface DBLog {
 }
 
 /**
+ * 写入 domains_cache 的上游域名数据
+ *
+ * NOTE: dns_state_known 表示本次调用已经拉取过该域名的真实解析记录，
+ * 因此 status / has_dns / dns_provider 可信、允许覆盖数据库中的旧值。
+ * 由 dns-provider.ts 的 computeDnsState() 统一产出，不要手工拼装。
+ */
+export interface UpstreamSubdomain {
+  id: number;
+  subdomain: string;
+  rootdomain: string;
+  full_domain: string;
+  status: string;
+  created_at?: string;
+  expires_at?: string;
+  disable_ns_management?: boolean | number;
+  has_dns?: boolean | number;
+  ns1?: string;
+  ns2?: string;
+  dns_provider?: string;
+  provider_account_id?: number | string | null;
+  /** Cloudflare 行携带 zone id；DNSHE 行留空 */
+  remote_id?: string | null;
+  dns_state_known?: boolean;
+}
+
+/** domains_cache.status 允许的三态取值（由 computeDnsState 产出） */
+const THREE_STATE_STATUSES = new Set(["已委派", "已解析", "未解析"]);
+
+/** 全部账号配额的缓存键（内容为按 account_id 升序排列的数组） */
+export const QUOTA_CACHE_KEY = "api_cache:quota";
+
+/** 配额缓存中的单个账号条目：成功时展开 quota 字段，失败时带 error */
+export type QuotaEntry = { account_id: number; alias: string; [key: string]: unknown };
+
+/**
  * 数据库封装操作
- * 
+ *
  * NOTE: 使用 D1Database 类型替代 any，获得完整的编译期类型检查
  */
 export class DatabaseManager {
@@ -178,8 +246,11 @@ export class DatabaseManager {
 
   /**
    * 自动确保所需的 D1 数据库表结构存在
+   *
+   * 返回是否自举成功。调用方（index.ts 的 ensureSchemaOnce）据此决定
+   * 是否缓存结果——失败就不缓存，留给下一次请求重试。
    */
-  async ensureTables() {
+  async ensureTables(): Promise<boolean> {
     try {
       await this.db.batch([
         this.db.prepare(`
@@ -188,6 +259,7 @@ export class DatabaseManager {
             alias TEXT NOT NULL,
             api_key TEXT NOT NULL UNIQUE,
             api_secret TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'dnshe',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );
         `),
@@ -203,6 +275,9 @@ export class DatabaseManager {
             expires_at TEXT NOT NULL,
             last_renewed_at TEXT,
             has_dns INTEGER DEFAULT 1,
+            dns_provider TEXT,
+            provider_account_id TEXT,
+            remote_id TEXT,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
           );
@@ -232,8 +307,35 @@ export class DatabaseManager {
           );
         `)
       ]);
+
+      // 兼容已部署的旧数据库：仅在缺少字段时执行一次轻量迁移。
+      //
+      // NOTE: 一次 PRAGMA 取回全部列名后统一补齐，缺几个字段都只多一次批量写，
+      // 保持「自举 = 2 次串行往返」这个开销不变（见 README 的性能小节）。
+      const domainColumns = await this.db.prepare("PRAGMA table_info(domains_cache)").all<{ name: string }>();
+      const existingColumns = new Set((domainColumns.results || []).map((column) => column.name));
+      const migrations: string[] = [];
+      if (!existingColumns.has("dns_provider")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN dns_provider TEXT");
+      }
+      if (!existingColumns.has("provider_account_id")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN provider_account_id TEXT");
+      }
+      if (!existingColumns.has("remote_id")) {
+        migrations.push("ALTER TABLE domains_cache ADD COLUMN remote_id TEXT");
+      }
+      const accountColumns = await this.db.prepare("PRAGMA table_info(accounts)").all<{ name: string }>();
+      const accountColumnNames = new Set((accountColumns.results || []).map((column) => column.name));
+      if (!accountColumnNames.has("provider")) {
+        migrations.push("ALTER TABLE accounts ADD COLUMN provider TEXT NOT NULL DEFAULT 'dnshe'");
+      }
+      if (migrations.length > 0) {
+        await this.db.batch(migrations.map((sql) => this.db.prepare(sql)));
+      }
+      return true;
     } catch (e) {
       console.error("Auto ensureTables error:", e);
+      return false;
     }
   }
 
@@ -426,6 +528,214 @@ export class DatabaseManager {
     }
   }
 
+  // ===== 配额缓存的按账号维护 =====
+  //
+  // NOTE: 配额缓存走的是「写操作回源回填、读操作只命中缓存」模型，TTL 长达 366 天。
+  // 但账号的增删改会改变账号集合，这份缓存却一直没跟着变，于是「账户配额」页
+  // 依然列着已解绑的账号、也看不到新绑定的账号，只能点「刷新」强制回源才对得上。
+  // 下面三个方法按账号粒度打补丁：解绑与改名零上游调用，只有新绑定/换 Key 才拉一次配额。
+  // 缓存本就不存在时一律直接跳过 —— 下一次读取会整体回源重建。
+
+  /** 读取配额缓存数组；缓存不存在或内容损坏时返回 null */
+  private async readQuotaCache(): Promise<QuotaEntry[] | null> {
+    const cached = await this.getCache(QUOTA_CACHE_KEY);
+    if (!cached) return null;
+    try {
+      const parsed = JSON.parse(cached);
+      return Array.isArray(parsed) ? (parsed as QuotaEntry[]) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** 写回配额缓存，并保持与 getAccounts() 相同的 id ASC 顺序（配额页按数组顺序渲染） */
+  private async writeQuotaCache(entries: QuotaEntry[]): Promise<void> {
+    const sorted = [...entries].sort((a, b) => Number(a.account_id) - Number(b.account_id));
+    await this.setCache(QUOTA_CACHE_KEY, JSON.stringify(sorted));
+  }
+
+  /** 解绑账号：摘掉对应条目 */
+  async removeAccountFromQuotaCache(accountId: number): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+    await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+  }
+
+  /** 仅改别名：就地改写缓存里的别名 */
+  async renameAccountInQuotaCache(accountId: number, alias: string): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+    if (!cached.some((q) => Number(q.account_id) === accountId)) return;
+    await this.writeQuotaCache(
+      cached.map((q) => (Number(q.account_id) === accountId ? { ...q, alias } : q))
+    );
+  }
+
+  /** 新绑定 / 换 Key：拉一次该账号的配额写回缓存，只影响这一个账号（Cloudflare 账号无配额概念，直接清掉缓存条目） */
+  async refreshAccountQuotaCache(accountId: number, alias: string, provider: AccountProvider = "dnshe"): Promise<void> {
+    const cached = await this.readQuotaCache();
+    if (cached === null) return;
+
+    if (provider === "cloudflare") {
+      await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+      return;
+    }
+
+    let entry: QuotaEntry;
+    try {
+      const { client } = await this.getClientForAccount(accountId);
+      if (!(client instanceof DNSHEClient)) {
+        await this.writeQuotaCache(cached.filter((q) => Number(q.account_id) !== accountId));
+        return;
+      }
+      const qRes = await client.getQuota();
+      entry = qRes && qRes.success
+        ? { account_id: accountId, alias, ...qRes.quota }
+        : { account_id: accountId, alias, error: qRes?.message || "获取额度失败" };
+    } catch (e: unknown) {
+      entry = { account_id: accountId, alias, error: e instanceof Error ? e.message : "获取额度失败" };
+    }
+
+    await this.writeQuotaCache([...cached.filter((q) => Number(q.account_id) !== accountId), entry]);
+  }
+
+  // ===== 会话 (Session) 管理 =====
+  //
+  // 会话以 settings 表中 key = `sess_<digest>` 的行表示（digest 是 token 的 SHA-256），
+  // value 存放到期时间的 Unix 秒级时间戳（字符串形式）。原始 token 服务端不落库，
+  // 因此拿到数据库文件也无法重放在线会话。
+  //
+  // NOTE: 历史版本把原始 token 直接当 key、value 固定写成 "valid" 且从不删除，于是
+  //       这张表随每次登录只进不出，而鉴权中间件每个请求都要查它。那些旧行在此
+  //       版本不再被 validateSession() 接受（键是原始 token，哈希后查不到），会在
+  //       purgeExpiredSessions() 里按 updated_at 超过 TTL 后一并清掉，自然排空；
+  //       升级部署后所有旧会话需要重新登录一次。
+
+  /** 会话有效期：7 天 */
+  static readonly SESSION_TTL_SECONDS = 7 * 24 * 3600;
+
+  /** Session Token 前缀（鉴权中间件据此区分会话 token 与应急令牌） */
+  static readonly SESSION_PREFIX = "dnshe_sess_";
+
+  /**
+   * 签发一个新会话，返回 Session Token
+   *
+   * NOTE: 库里只保存 token 的 SHA-256 摘要（key = `sess_<digest>`），
+   * 原始 token 只在签发时返回给客户端一次，服务端无法反推。
+   */
+  async createSession(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<string> {
+    const token = `${DatabaseManager.SESSION_PREFIX}${crypto.randomUUID()}`;
+    const digest = await sha256Hex(token);
+    const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+    await this.setSetting(`sess_${digest}`, String(expiresAt));
+    return token;
+  }
+
+  /**
+   * 校验会话是否有效（存在且未过期）
+   *
+   * NOTE: 只认哈希后的键。历史版本以原始 token 直接做 settings key 且值写死
+   * "valid" 的行在此不再放行 —— 它们会在 cron 的 purgeExpiredSessions() 里被回收，
+   * 升级后所有旧会话需要重新登录一次。
+   */
+  async validateSession(token: string): Promise<boolean> {
+    if (!token.startsWith(DatabaseManager.SESSION_PREFIX)) return false;
+    const digest = await sha256Hex(token);
+    const stored = await this.getSetting(`sess_${digest}`);
+    if (!stored) return false;
+    const expiresAt = Number(stored);
+    return Number.isFinite(expiresAt) && expiresAt > Math.floor(Date.now() / 1000);
+  }
+
+  /**
+   * 注销会话（登出时删除对应的哈希行，使已签发的 token 立即失效）
+   */
+  async revokeSession(token: string): Promise<void> {
+    if (!token || !token.startsWith(DatabaseManager.SESSION_PREFIX)) return;
+    try {
+      const digest = await sha256Hex(token);
+      await this.db.prepare("DELETE FROM settings WHERE key = ?").bind(`sess_${digest}`).run();
+    } catch (e) {
+      console.error("revokeSession error:", e);
+    }
+  }
+
+  /**
+   * 清理已过期会话 — 供每日 cron 调用，返回清理条数
+   */
+  async purgeExpiredSessions(ttlSeconds = DatabaseManager.SESSION_TTL_SECONDS): Promise<number> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+      // 1) 新格式：value 是到期时间戳，直接按数值比较
+      const expired = await this.db.prepare(
+        "DELETE FROM settings WHERE key LIKE 'sess_%' AND value != 'valid' AND CAST(value AS INTEGER) <= ?"
+      ).bind(nowSec).run();
+
+      // 2) 历史遗留格式：value = 'valid' 没有到期时间，退化为按 updated_at 超过 TTL 判定。
+      //    updated_at 由 setSetting 以北京时间写入，所以这里也要用同一套格式生成截止值，
+      //    否则会差 8 小时。格式定宽，字符串比较等价于时间比较。
+      const legacyCutoff = this.toBeijingString(new Date((nowSec - ttlSeconds) * 1000));
+      const legacy = await this.db.prepare(
+        "DELETE FROM settings WHERE key LIKE 'sess_%' AND value = 'valid' AND updated_at <= ?"
+      ).bind(legacyCutoff).run();
+
+      return (expired.meta?.changes || 0) + (legacy.meta?.changes || 0);
+    } catch (e) {
+      console.error("purgeExpiredSessions error:", e);
+      return 0;
+    }
+  }
+
+  // ===== 登录失败限流 =====
+  //
+  // NOTE: 用 cache 表存「失败计数」，带窗口过期时间，由 purgeExpiredCache() 统一回收。
+  // key 形如 login_fail:<scope>，scope 由调用方拼接（用户名 + 客户端 IP），
+  // 必须在调用前完成长度限制，防止攻击者用超长输入把 cache 表撑爆。
+
+  /** 读取指定 scope 当前的失败次数（已过期的计数返回 0） */
+  async countLoginFailures(scope: string): Promise<number> {
+    try {
+      const row = await this.db.prepare(
+        "SELECT value FROM cache WHERE key = ? AND expires_at > ?"
+      ).bind(`login_fail:${scope}`, Math.floor(Date.now() / 1000)).first<{ value: string }>();
+      if (!row) return 0;
+      const n = parseInt(String(row.value), 10);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) {
+      console.error("countLoginFailures error:", e);
+      return 0;
+    }
+  }
+
+  /**
+   * 记录一次登录失败（窗口内自增计数，窗口滑动到调用时刻 + windowSeconds）
+   *
+   * @returns 自增后的失败次数
+   */
+  async recordLoginFailure(scope: string, windowSeconds = 15 * 60): Promise<number> {
+    try {
+      const expiresAt = Math.floor(Date.now() / 1000) + windowSeconds;
+      await this.db.prepare(
+        `INSERT INTO cache (key, value, expires_at) VALUES (?, '1', ?)
+         ON CONFLICT(key) DO UPDATE SET
+           value = CAST(CAST(value AS INTEGER) + 1 AS TEXT),
+           expires_at = excluded.expires_at`
+      ).bind(`login_fail:${scope}`, expiresAt).run();
+    } catch (e) {
+      console.error("recordLoginFailure error:", e);
+    }
+    return this.countLoginFailures(scope);
+  }
+
+  /** 登录成功后清空该 scope 的失败计数 */
+  async clearLoginFailures(scope: string): Promise<void> {
+    try {
+      await this.db.prepare("DELETE FROM cache WHERE key = ?").bind(`login_fail:${scope}`).run();
+    } catch (e) {
+      console.error("clearLoginFailures error:", e);
+    }
+  }
+
   /**
    * 读取管理员鉴权配置
    *
@@ -433,11 +743,37 @@ export class DatabaseManager {
    * TOTP 密钥使用 AES-GCM 加密，读取时自动解密为原文。
    */
   async getAuthConfig(): Promise<AuthConfig> {
-    const username = (await this.getSetting("auth_username")) || "admin";
-    const passHash = (await this.getSetting("auth_pass_hash")) || "";
-    const passSalt = (await this.getSetting("auth_pass_salt")) || "";
-    const twoFaEnabled = (await this.getSetting("auth_2fa_enabled")) === "1";
-    const encryptedSecret = (await this.getSetting("auth_2fa_secret")) || "";
+    // NOTE: 这里原先是 5 次串行 await getSetting()，也就是 5 条独立 SELECT、5 次 D1 往返。
+    //       D1 主库与执行 Worker 的边缘节点常常不在同一区域，单次往返实测 300-450ms，
+    //       仅这一个函数就能给 /api/auth/status 这类"只读几行配置"的接口压上约 2 秒。
+    //       改为一条 IN 查询后 5 次往返收敛成 1 次。
+    const AUTH_KEYS = [
+      "auth_username",
+      "auth_pass_hash",
+      "auth_pass_salt",
+      "auth_2fa_enabled",
+      "auth_2fa_secret",
+    ];
+
+    const values = new Map<string, string>();
+    try {
+      const { results } = await this.db
+        .prepare(
+          `SELECT key, value FROM settings WHERE key IN (${AUTH_KEYS.map(() => "?").join(", ")})`
+        )
+        .bind(...AUTH_KEYS)
+        .all<{ key: string; value: string }>();
+      for (const row of results || []) {
+        values.set(row.key, String(row.value));
+      }
+    } catch (e) {
+      // 与原 getSetting 的容错行为保持一致：读失败按「尚未配置」处理，
+      // 调用方会落到未初始化分支，而不是抛错把登录页打死。
+      console.error("getAuthConfig read error:", e);
+    }
+
+    const passHash = values.get("auth_pass_hash") || "";
+    const encryptedSecret = values.get("auth_2fa_secret") || "";
 
     let twoFaSecret = "";
     if (encryptedSecret) {
@@ -449,10 +785,10 @@ export class DatabaseManager {
     }
 
     return {
-      username,
+      username: values.get("auth_username") || "admin",
       passHash,
-      passSalt,
-      twoFaEnabled,
+      passSalt: values.get("auth_pass_salt") || "",
+      twoFaEnabled: values.get("auth_2fa_enabled") === "1",
       twoFaSecret,
       initialized: !!passHash,
     };
@@ -500,14 +836,23 @@ export class DatabaseManager {
 
   /**
    * 获取当前北京时间 (UTC+8) 的 ISO 格式字符串
-   * 
+   *
    * NOTE: Cloudflare Workers / D1 的 CURRENT_TIMESTAMP 默认为 UTC，
    * 为了让日志时间与用户所在时区一致，手动构造北京时间。
    */
   private getBeijingNow(): string {
-    const now = new Date();
+    return this.toBeijingString(new Date());
+  }
+
+  /**
+   * 把任意时刻格式化成与 getBeijingNow() 完全一致的北京时间字符串
+   *
+   * NOTE: 供 purgeExpiredSessions() 生成与 updated_at 同格式的比较基准用。
+   * 格式定宽（YYYY-MM-DD HH:mm:ss.sss），因此字符串比较等价于时间先后比较。
+   */
+  private toBeijingString(date: Date): string {
     const beijingOffset = 8 * 60 * 60 * 1000;
-    const beijingTime = new Date(now.getTime() + beijingOffset);
+    const beijingTime = new Date(date.getTime() + beijingOffset);
     return beijingTime.toISOString().replace("T", " ").replace("Z", "");
   }
 
@@ -556,12 +901,12 @@ export class DatabaseManager {
   /**
    * 实时更新域名的解析状态与 NS 标记 (用于 DNS 增删改后精准即时刷新状态)
    */
-  async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number) {
+  async updateDomainStatusAndDns(domainId: number, status: string, hasDns: number, dnsProvider?: string) {
     try {
       const beijingNow = this.getBeijingNow();
       await this.db.prepare(
-        "UPDATE domains_cache SET status = ?, has_dns = ?, updated_at = ? WHERE id = ?"
-      ).bind(status, hasDns, beijingNow, domainId).run();
+        "UPDATE domains_cache SET status = ?, has_dns = ?, dns_provider = ?, updated_at = ? WHERE id = ?"
+      ).bind(status, hasDns, dnsProvider || (hasDns ? "system" : "external"), beijingNow, domainId).run();
     } catch (e) {
       console.error("Failed to update domain status and dns:", e);
     }
@@ -610,47 +955,93 @@ export class DatabaseManager {
    * 添加 API 账户
    * alias 可留空，留空时自动通过 keys/list 接口解析密钥名称 (key_name) 作为别名
    */
-  async addAccount(alias: string, apiKey: string, apiSecret: string): Promise<DBAccount> {
-    const client = new DNSHEClient(apiKey, apiSecret);
-
-    // 别名处理：为空时调用 keys/list 同时完成校验与别名解析（一次请求）
+  async addAccount(alias: string, apiKey: string, apiSecret: string, provider: AccountProvider = "dnshe"): Promise<DBAccount> {
+    let uniqueKey = apiKey;
+    let credential = apiSecret;
     let finalAlias = (alias || "").trim();
-    if (!finalAlias) {
-      const resolved = await this.resolveAliasFromKey(client, apiKey);
-      if (!resolved) {
-        throw new Error("API 密钥有效但未能自动获取密钥名称作为别名，请手动填写别名");
-      }
-      finalAlias = resolved;
-    } else {
-      // 显式提供别名时，仍需校验密钥是否可用
+
+    if (provider === "cloudflare") {
+      // Cloudflare 账号：apiSecret 即 API Token（apiKey 参数不使用）
+      const cfClient = new CloudflareClient(apiSecret);
+      let verify: { token_id: string; status: string };
       try {
-        await client.getQuota();
+        verify = await cfClient.verifyToken();
       } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证 API 密钥有效性: ${message}`);
+        throw new Error(`Cloudflare Token 校验失败: ${e instanceof Error ? e.message : "未知错误"}`);
+      }
+      if (verify.status && verify.status.toLowerCase() !== "active") {
+        throw new Error(`Cloudflare Token 状态异常 (${verify.status})，请检查 Token 是否被禁用`);
+      }
+
+      // 别名留空时自动解析 Cloudflare 账号名。
+      // NOTE: 实测仅有 Zone 类权限的 Token 调 GET /accounts 会「成功但返回空列表」
+      //（没有 Account:Read 权限时不报错、只是看不到账号），因此「结果为空」与
+      //「请求失败」都要回退到 GET /zones —— 每个 zone 都内嵌 account.id / account.name，
+      // 凭 Zone:Read 即可拿到；两者都拿不到才退回 Token id。
+      let cfAccount: { id?: string; name?: string } | undefined;
+      try {
+        cfAccount = (await cfClient.listAccounts())[0];
+      } catch {
+        cfAccount = undefined;
+      }
+      if (!cfAccount) {
+        try {
+          cfAccount = (await cfClient.listZones()).find((z) => z.account?.id)?.account;
+        } catch {
+          cfAccount = undefined;
+        }
+      }
+      if (cfAccount?.id) {
+        if (!finalAlias) finalAlias = normalizeCfAlias(cfAccount.name || "") || cfAccount.id;
+        uniqueKey = `cf:${cfAccount.id}`;
+      }
+      if (!finalAlias) finalAlias = `Cloudflare ${String(verify.token_id).slice(0, 8)}`;
+      if (uniqueKey === apiKey) uniqueKey = `cf:token:${verify.token_id}`;
+    } else {
+      const client = new DNSHEClient(apiKey, apiSecret);
+
+      // 别名处理：为空时调用 keys/list 同时完成校验与别名解析（一次请求）
+      if (!finalAlias) {
+        const resolved = await this.resolveAliasFromKey(client, apiKey);
+        if (!resolved) {
+          throw new Error("API 密钥有效但未能自动获取密钥名称作为别名，请手动填写别名");
+        }
+        finalAlias = resolved;
+      } else {
+        // 显式提供别名时，仍需校验密钥是否可用
+        try {
+          await client.getQuota();
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证 API 密钥有效性: ${message}`);
+        }
       }
     }
 
-    const encryptedSecret = await encryptText(apiSecret, this.aesKey);
+    const encryptedSecret = await encryptText(credential, this.aesKey);
 
     // NOTE: 先执行写库（api_key 有 UNIQUE 约束），只有真正入库成功后才写"绑定成功"日志，
     // 避免重复绑定等失败场景下 INSERT 抛异常、成功日志却已落库导致的"失败却显示成功"问题。
     try {
       await this.db.prepare(
-        "INSERT INTO accounts (alias, api_key, api_secret) VALUES (?, ?, ?)"
-      ).bind(finalAlias, apiKey, encryptedSecret).run();
+        "INSERT INTO accounts (alias, api_key, api_secret, provider) VALUES (?, ?, ?, ?)"
+      ).bind(finalAlias, uniqueKey, encryptedSecret, provider).run();
     } catch (e: unknown) {
       const raw = e instanceof Error ? e.message : String(e);
-      // 唯一约束冲突（重复绑定同一 api_key）翻译为友好中文提示
+      // 唯一约束冲突（重复绑定同一凭据）翻译为友好中文提示
       if (raw.includes("UNIQUE") || raw.toLowerCase().includes("unique constraint")) {
-        throw new Error(`该 API Key 已被绑定，请勿重复绑定（别名: ${finalAlias}）`);
+        throw new Error(
+          provider === "cloudflare"
+            ? "该 Cloudflare 账号已被绑定，请勿重复绑定（别名: " + finalAlias + "）"
+            : `该 API Key 已被绑定，请勿重复绑定（别名: ${finalAlias}）`
+        );
       }
       throw new Error(`账户入库失败: ${raw}`);
     }
 
     const result = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts WHERE api_key = ?"
-    ).bind(apiKey).first<DBAccount>();
+      "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE api_key = ?"
+    ).bind(uniqueKey).first<DBAccount>();
 
     // 入库成功后再记录日志：区分是否启用了 AES-GCM 加密
     if (!this.aesKey) {
@@ -665,45 +1056,67 @@ export class DatabaseManager {
   /**
    * 获取所有账户
    */
-  async getAccounts(): Promise<DBAccount[]> {
-    const { results } = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts ORDER BY id ASC"
-    ).all<DBAccount>();
+  async getAccounts(provider?: AccountProvider): Promise<DBAccount[]> {
+    const query = provider
+      ? "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE provider = ? ORDER BY id ASC"
+      : "SELECT id, alias, api_key, provider, created_at FROM accounts ORDER BY id ASC";
+    const statement = this.db.prepare(query);
+    const { results } = provider
+      ? await statement.bind(provider).all<DBAccount>()
+      : await statement.all<DBAccount>();
     return results || [];
   }
 
   /**
-   * 更新 API 账户（可仅修改别名，或同时更换 API Key/Secret）
+   * 更新 API 账户（可仅修改别名，或同时更换凭据）
    */
   async updateAccount(id: number, alias: string, apiKey?: string, apiSecret?: string): Promise<DBAccount> {
     const existing = await this.db.prepare(
-      "SELECT alias, api_key, api_secret FROM accounts WHERE id = ?"
+      "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
     ).bind(id).first();
     if (!existing) {
       throw new Error(`未找到 ID 为 ${id} 的账户`);
     }
-    const existingRow = existing as { alias: string; api_key: string; api_secret: string };
+    const existingRow = existing as { alias: string; api_key: string; api_secret: string; provider?: string };
 
     const finalAlias = (alias || "").trim() || existingRow.alias;
     let finalApiKey = existingRow.api_key;
     let finalEncryptedSecret = existingRow.api_secret;
 
-    // 若提供了新的 API Key/Secret，则校验有效性并加密替换；留空表示保持不变
-    const newKey = (apiKey || "").trim();
-    const newSecret = (apiSecret || "").trim();
-    if (newKey || newSecret) {
-      if (!newKey || !newSecret) {
-        throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
+    if (existingRow.provider === "cloudflare") {
+      // Cloudflare 账号：apiSecret 即 API Token，只需单独更换 Token；api_key（账号唯一键）保持不变
+      const newToken = (apiSecret || "").trim();
+      if (newToken) {
+        const cfClient = new CloudflareClient(newToken);
+        try {
+          const verify = await cfClient.verifyToken();
+          if (verify.status && verify.status.toLowerCase() !== "active") {
+            throw new Error(`Token 状态异常 (${verify.status})`);
+          }
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证新 Cloudflare Token: ${message}`);
+        }
+        finalEncryptedSecret = await encryptText(newToken, this.aesKey);
       }
-      const client = new DNSHEClient(newKey, newSecret);
-      try {
-        await client.getQuota();
-      } catch (e: unknown) {
-        const message = e instanceof Error ? e.message : "未知错误";
-        throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+    } else {
+      // 若提供了新的 API Key/Secret，则校验有效性并加密替换；留空表示保持不变
+      const newKey = (apiKey || "").trim();
+      const newSecret = (apiSecret || "").trim();
+      if (newKey || newSecret) {
+        if (!newKey || !newSecret) {
+          throw new Error("更换 API 密钥时，API Key 与 API Secret 必须同时填写");
+        }
+        const client = new DNSHEClient(newKey, newSecret);
+        try {
+          await client.getQuota();
+        } catch (e: unknown) {
+          const message = e instanceof Error ? e.message : "未知错误";
+          throw new Error(`无法验证新 API 密钥有效性: ${message}`);
+        }
+        finalApiKey = newKey;
+        finalEncryptedSecret = await encryptText(newSecret, this.aesKey);
       }
-      finalApiKey = newKey;
-      finalEncryptedSecret = await encryptText(newSecret, this.aesKey);
     }
 
     try {
@@ -719,7 +1132,7 @@ export class DatabaseManager {
     }
 
     const result = await this.db.prepare(
-      "SELECT id, alias, api_key, created_at FROM accounts WHERE id = ?"
+      "SELECT id, alias, api_key, provider, created_at FROM accounts WHERE id = ?"
     ).bind(id).first<DBAccount>();
 
     await this.writeLog("success", "operation", `账户 [${finalAlias}] 信息已更新`);
@@ -732,37 +1145,65 @@ export class DatabaseManager {
   async deleteAccount(id: number) {
     const account = await this.db.prepare("SELECT alias FROM accounts WHERE id = ?").bind(id).first();
     const alias = account ? (account as { alias: string }).alias : `ID ${id}`;
-    
+
+    // NOTE: domains_cache 会随账号级联删除，但这些域名的 DNS 记录缓存不会——
+    // cache 表里会留下一批永远不会再被读取的孤儿行，直到 366 天兜底 TTL 到期。
+    // 必须在删账号之前清，否则级联删完就查不到这些域名的 id 了。
+    try {
+      await this.db.prepare(
+        "DELETE FROM cache WHERE key IN (SELECT 'api_cache:dns:' || id FROM domains_cache WHERE account_id = ?)"
+      ).bind(id).run();
+    } catch (e) {
+      console.error("Failed to purge dns cache for account:", e);
+    }
+
     await this.db.prepare("DELETE FROM accounts WHERE id = ?").bind(id).run();
     await this.writeLog("info", "operation", `解绑了账户 [${alias}]，其名下的域名缓存已被自动级联清理`);
   }
 
   /**
-   * 根据 ID 获取解密后的 API 客户端
+   * 根据 ID 获取解密后的 API 客户端（按账号 provider 返回 DNSHE / Cloudflare 客户端）
    */
-  async getClientForAccount(id: number): Promise<{ client: DNSHEClient; alias: string }> {
+  async getClientForAccount(id: number): Promise<{ client: DNSHEClient | CloudflareClient; alias: string; provider: AccountProvider }> {
     const account = await this.db.prepare(
-      "SELECT alias, api_key, api_secret FROM accounts WHERE id = ?"
+      "SELECT alias, api_key, api_secret, provider FROM accounts WHERE id = ?"
     ).bind(id).first();
-    
+
     if (!account) {
       throw new Error(`未找到 ID 为 ${id} 的账户`);
     }
 
-    const typedAccount = account as { alias: string; api_key: string; api_secret: string };
+    const typedAccount = account as { alias: string; api_key: string; api_secret: string; provider?: string };
     const apiSecret = await decryptText(typedAccount.api_secret, this.aesKey);
+    if (typedAccount.provider === "cloudflare") {
+      return {
+        client: new CloudflareClient(apiSecret),
+        alias: typedAccount.alias,
+        provider: "cloudflare"
+      };
+    }
     return {
       client: new DNSHEClient(typedAccount.api_key, apiSecret),
-      alias: typedAccount.alias
+      alias: typedAccount.alias,
+      provider: "dnshe"
     };
   }
 
   /**
    * 跨账号列出域名（包含所属账户别名），支持搜索与状态过滤
+   *
+   * NOTE: provider 过滤 —— 缺省时排除 Cloudflare 账号的 zone 行（它们在独立的
+   * Cloudflare 标签页展示，DNSHE 域名页不应混入）；显式传 "cloudflare" 时只返回
+   * 这些行，传 "dnshe" 时只返回 DNSHE 账号的行。
    */
-  async getDomains(search = "", status = "", accountId?: number): Promise<DBDomain[]> {
+  async getDomains(
+    search = "",
+    status = "",
+    accountId?: number,
+    provider?: AccountProvider
+  ): Promise<DBDomain[]> {
     let query = `
-      SELECT d.*, a.alias as account_alias 
+      SELECT d.*, a.alias as account_alias, a.provider as account_provider
       FROM domains_cache d
       LEFT JOIN accounts a ON d.account_id = a.id
       WHERE 1=1
@@ -785,9 +1226,17 @@ export class DatabaseManager {
       binds.push(accountId);
     }
 
+    if (provider === "cloudflare") {
+      query += " AND a.provider = 'cloudflare'";
+    } else if (provider === "dnshe") {
+      query += " AND IFNULL(a.provider, 'dnshe') != 'cloudflare'";
+    } else {
+      query += " AND IFNULL(a.provider, 'dnshe') != 'cloudflare'";
+    }
+
     query += " ORDER BY d.expires_at ASC";
 
-    const { results } = await this.db.prepare(query).bind(...binds).all<DBDomain>();
+    const { results } = await this.db.prepare(query).bind(...binds).all<DBDomain & { account_provider?: string }>();
     return results || [];
   }
 
@@ -809,23 +1258,99 @@ export class DatabaseManager {
   }
 
   /**
+   * 构造单条域名的 UPSERT 语句
+   *
+   * NOTE: 只有当调用方带上 dns_state_known（即本次确实拉取到了该域名的解析记录）时，
+   * 才允许覆盖已有行的 status / has_dns / dns_provider。否则仅刷新到期时间等注册信息，
+   * 保留数据库中已识别出的三态 —— 否则上游 subdomains/list 返回的 active 状态
+   * 会把整个账号下的「已委派」域名刷成「已解析 + 系统默认」。
+   */
+  private buildDomainUpsert(accountId: number, sub: UpstreamSubdomain): D1PreparedStatement {
+    let hasDnsVal = 1;
+    if (sub.dns_state_known) {
+      // 调用方已经读过该域名的真实解析记录，直接采信，不再从注册商层面的 ns1/ns2 反推
+      hasDnsVal = sub.has_dns ? 1 : 0;
+    } else if (sub.disable_ns_management) {
+      hasDnsVal = 0;
+    } else if (sub.ns1 || sub.ns2) {
+      // 判断 NS 是否为默认 ns1.dnshe.com / ns2.dnshe.com
+      const ns1 = (sub.ns1 || "").toLowerCase();
+      const ns2 = (sub.ns2 || "").toLowerCase();
+      const isDefault = ns1.includes("dnshe.com") || ns2.includes("dnshe.com");
+      hasDnsVal = isDefault ? 1 : 0;
+    } else if (sub.has_dns !== undefined) {
+      hasDnsVal = sub.has_dns ? 1 : 0;
+    }
+    const dnsProvider = sub.dns_provider ?? null;
+
+    // 解析服务商账号 ID —— 与三态不同，它来自 subdomains/list，任何一次同步都可信，
+    // 因此不受 dns_state_known 约束；统一转成字符串存，避免上游在 number / string
+    // 之间摇摆时前端比较失配。
+    const providerAccountId =
+      sub.provider_account_id === undefined || sub.provider_account_id === null
+        ? null
+        : String(sub.provider_account_id);
+
+    // 解析状态未知时，冲突分支保持数据库中的原值不动
+    const dnsStateAssignments = sub.dns_state_known
+      ? `status = excluded.status,
+            has_dns = excluded.has_dns,
+            dns_provider = COALESCE(excluded.dns_provider, domains_cache.dns_provider),`
+      : "";
+
+    // 绑定的 status 在「解析状态未知」时只对 INSERT 生效（新行没有旧值可保留）。
+    //
+    // NOTE: 此时上游给的是注册态（active / Registered），前端会把它显示成「已解析」——
+    // 新绑定账号里恰好被限流、没拉到解析记录的域名就会挂上一个假的「已解析 + 系统默认」。
+    // 落成中性的「未解析」宁可少报也不误报，下一次同步会纠正过来。
+    const statusVal = sub.dns_state_known || THREE_STATE_STATUSES.has(sub.status)
+      ? sub.status
+      : "未解析";
+
+    return this.db.prepare(`
+      INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, dns_provider, provider_account_id, remote_id, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        account_id = excluded.account_id,
+        provider_account_id = COALESCE(excluded.provider_account_id, domains_cache.provider_account_id),
+        remote_id = COALESCE(excluded.remote_id, domains_cache.remote_id),
+        ${dnsStateAssignments}
+        created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
+        expires_at = excluded.expires_at,
+        updated_at = excluded.updated_at
+    `).bind(
+      sub.id,
+      accountId,
+      sub.subdomain,
+      sub.rootdomain,
+      sub.full_domain,
+      statusVal,
+      sub.created_at || "",
+      sub.expires_at || "",
+      hasDnsVal,
+      dnsProvider,
+      providerAccountId,
+      sub.remote_id || null,
+      this.getBeijingNow()
+    );
+  }
+
+  /**
+   * 写入/更新单条域名缓存（不做账号级别的清理扫描）
+   *
+   * NOTE: 供在线注册等「只新增一个域名」的场景使用。不能改用 syncAccountDomains，
+   * 因为后者会把没出现在入参列表里的域名当作上游已删除而清除。
+   */
+  async upsertDomain(accountId: number, sub: UpstreamSubdomain): Promise<void> {
+    await this.buildDomainUpsert(accountId, sub).run();
+  }
+
+  /**
    * 同步单个账号名下的域名到缓存表
    */
-  async syncAccountDomains(accountId: number, subdomains: Array<{
-    id: number;
-    subdomain: string;
-    rootdomain: string;
-    full_domain: string;
-    status: string;
-    created_at?: string;
-    expires_at?: string;
-    disable_ns_management?: boolean | number;
-    has_dns?: boolean | number;
-    ns1?: string;
-    ns2?: string;
-  }>) {
+  async syncAccountDomains(accountId: number, subdomains: UpstreamSubdomain[]) {
     const statements: D1PreparedStatement[] = [];
-    
+
     // 1. 获取当前缓存中该账号所有的域名 ID 集合，以便删除在 DNSHE 后台已经被删掉的域名
     const cachedDomains = await this.db.prepare(
       "SELECT id FROM domains_cache WHERE account_id = ?"
@@ -835,42 +1360,7 @@ export class DatabaseManager {
 
     // 2. 准备插入/更新操作
     for (const sub of subdomains) {
-      // 判断 NS 是否为默认 ns1.dnshe.com / ns2.dnshe.com，或 disable_ns_management 状态
-      let hasDnsVal = 1;
-      if (sub.disable_ns_management) {
-        hasDnsVal = 0;
-      } else if (sub.ns1 || sub.ns2) {
-        const ns1 = (sub.ns1 || "").toLowerCase();
-        const ns2 = (sub.ns2 || "").toLowerCase();
-        const isDefault = ns1.includes("dnshe.com") || ns2.includes("dnshe.com");
-        hasDnsVal = isDefault ? 1 : 0;
-      } else if (sub.has_dns !== undefined) {
-        hasDnsVal = sub.has_dns ? 1 : 0;
-      }
-
-      statements.push(
-        this.db.prepare(`
-          INSERT INTO domains_cache (id, account_id, subdomain, rootdomain, full_domain, status, created_at, expires_at, has_dns, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            status = excluded.status,
-            created_at = COALESCE(NULLIF(excluded.created_at, ''), domains_cache.created_at),
-            expires_at = excluded.expires_at,
-            has_dns = excluded.has_dns,
-            updated_at = excluded.updated_at
-        `).bind(
-          sub.id,
-          accountId,
-          sub.subdomain,
-          sub.rootdomain,
-          sub.full_domain,
-          sub.status,
-          sub.created_at || "",
-          sub.expires_at || "",
-          hasDnsVal,
-          this.getBeijingNow()
-        )
-      );
+      statements.push(this.buildDomainUpsert(accountId, sub));
     }
 
     // 3. 准备删除操作（清理已经被删除的域名）

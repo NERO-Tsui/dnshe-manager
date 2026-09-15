@@ -1,10 +1,15 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { cors } from "hono/cors";
-import { DatabaseManager, timingSafeEqual } from "./db";
+import { DatabaseManager, timingSafeEqual, QUOTA_CACHE_KEY } from "./db";
+import type { DBDomain } from "./db";
 import { DNSHEClient } from "./dnshe";
-import type { CreateDnsRecordParams } from "./dnshe";
-import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification } from "./cron";
+import type { CreateDnsRecordParams, UpdateDnsRecordParams } from "./dnshe";
+import { CloudflareClient, mapZoneToUpstream } from "./cloudflare";
+import { runDailySyncAndRenewal, fetchAllSubdomainsFromClient, sendTelegramNotification, sendWebhookNotification } from "./cron";
+import type { WebhookType } from "./cron";
+import { computeDnsState } from "./dns-provider";
+import type { DnsState } from "./dns-provider";
 import { toASCII } from "./punycode";
 
 /**
@@ -38,7 +43,16 @@ type Bindings = {
   DEFAULT_API_ALIAS?: string;
 };
 
-// NOTE: 深度同步单个账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
+// NOTE: 深度同步 Cloudflare 账号的 zone 列表。zones 拉取成功即视为权威结论——
+// 上游删掉的 zone 会由 syncAccountDomains 的差集清理逻辑移除，包括 0 个 zone 的情况。
+// zone → 上游行 的映射复用 cloudflare.ts 的 mapZoneToUpstream。
+async function syncCloudflareZones(dbManager: DatabaseManager, accountId: number, client: CloudflareClient): Promise<number> {
+  const zones = await client.listZones();
+  await dbManager.syncAccountDomains(accountId, zones.map(mapZoneToUpstream));
+  return zones.length;
+}
+
+// NOTE: 深度同步单个 DNSHE 账号的域名缓存 — 逐个拉取每个域名的 DNS 记录，自动分类（已委派/已解析/未解析）
 // 与 cron.ts 中 "同步所有域名" 的逻辑保持一致，供绑定/批量/修改换 Key 后调用
 async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: number, client: DNSHEClient): Promise<number> {
   const subdomains = await fetchAllSubdomainsFromClient(client);
@@ -49,30 +63,15 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
       try {
         const recordsRes = await client.listDnsRecords(sub.id);
         const records = recordsRes.records || [];
-        const customNsRecord = records.find(
-          (r) => r.type === "NS" && !String(r.content || "").toLowerCase().includes("dnshe.com")
-        );
-
-        let computedStatus = sub.status;
-        let hasDnsVal = 1;
-        if (customNsRecord) {
-          computedStatus = "已委派";
-          hasDnsVal = 0;
-        } else if (records.length > 0) {
-          computedStatus = "已解析";
-          hasDnsVal = 1;
-        } else {
-          computedStatus = "未解析";
-          hasDnsVal = 1;
-        }
 
         // 深度同步拿到的真实解析记录一并回填缓存，后续打开 DNS 面板直接命中、零上游调用
         await dbManager.setCache(`api_cache:dns:${sub.id}`, JSON.stringify(records));
 
-        return { ...sub, status: computedStatus, has_dns: hasDnsVal };
+        return { ...sub, ...computeDnsState(records) };
       } catch (e: unknown) {
         console.error(`listDnsRecords failed for subdomain ${sub.id}:`, e);
-        return { ...sub, has_dns: 1 };
+        // 上游临时失败时不带 dns_state_known，缓存中已识别出的三态与托管商保持不变。
+        return { ...sub };
       }
     })
   );
@@ -83,15 +82,23 @@ async function deepSyncAccountDomains(dbManager: DatabaseManager, accountId: num
   return subdomains.length;
 }
 
-// NOTE: 批量绑定后逐个账号深度同步域名（间隔 1.2s 规避 DNSHE 速率限制）
-async function syncDomainsForAccounts(dbManager: DatabaseManager, accountIds: number[]) {
+// NOTE: 账号绑定/换 Key 后逐个账号深度同步域名，并刷新该账号的配额缓存
+//       （间隔 1.2s 规避 DNSHE 速率限制）
+async function resyncAccountsInBackground(dbManager: DatabaseManager, accountIds: number[]) {
   for (const id of accountIds) {
     try {
-      const { client } = await dbManager.getClientForAccount(id);
-      const synced = await deepSyncAccountDomains(dbManager, id, client);
+      const { client, alias, provider } = await dbManager.getClientForAccount(id);
+      // 先刷配额缓存再同步域名：前端是以「该账号的域名已落库」作为后台任务完成的信号，
+      // 放在后面做会让配额缓存慢于这个信号，用户切到配额页仍是旧数据
+      await dbManager.refreshAccountQuotaCache(id, alias, provider);
+      const synced = client instanceof CloudflareClient
+        ? await syncCloudflareZones(dbManager, id, client)
+        : client instanceof DNSHEClient
+          ? await deepSyncAccountDomains(dbManager, id, client)
+          : 0;
       console.log(`Deep sync finished for account ${id}: ${synced} domains`);
     } catch (e: unknown) {
-      console.error(`Background domain deep sync failed for account ${id}:`, e);
+      console.error(`Background account resync failed for account ${id}:`, e);
     }
     await sleep(1200);
   }
@@ -100,6 +107,49 @@ async function syncDomainsForAccounts(dbManager: DatabaseManager, accountIds: nu
 // NOTE: 简易异步等待工具
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 注册成功后，只把新增的这一个域名写入 domains_cache。
+ *
+ * NOTE: 这里刻意不走 syncAccountDomains —— 它会按账号全量覆盖，而 subdomains/list
+ * 不返回解析记录，结果是同账号下所有「已委派」域名被刷成「已解析 + 系统默认」。
+ * 单条 upsert 既不碰其他行，也不需要为整个账号重新拉一遍 DNS 记录。
+ */
+async function cacheNewlyRegisteredDomain(
+  dbManager: DatabaseManager,
+  client: DNSHEClient,
+  accountId: number,
+  subdomainId: number | undefined,
+  fullDomain: string
+): Promise<void> {
+  // 上游只回传 subdomain_id / full_domain，注册时间与到期时间仍需从列表接口取
+  const subdomains = await fetchAllSubdomainsFromClient(client);
+  const created = subdomains.find(
+    (sub) => (subdomainId !== undefined && sub.id === subdomainId) || sub.full_domain === fullDomain
+  );
+  if (!created) {
+    console.error(`注册后未在上游列表中找到新域名: ${fullDomain}`);
+    return;
+  }
+
+  // 新域名理论上是「未解析」，但上游可能自动创建默认记录，仍以真实记录为准
+  let dnsState: Partial<DnsState> = {
+    status: "未解析",
+    has_dns: 1,
+    dns_provider: "system"
+  };
+  try {
+    const recordsRes = await client.listDnsRecords(created.id);
+    const records = recordsRes.records || [];
+    await dbManager.setCache(`api_cache:dns:${created.id}`, JSON.stringify(records));
+    dnsState = computeDnsState(records);
+  } catch (e) {
+    // 拉取失败时按新域名的默认三态入库；不带 dns_state_known，避免覆盖历史行的已有状态
+    console.error(`注册后拉取新域名解析记录失败 [${created.id}]:`, e);
+  }
+
+  await dbManager.upsertDomain(accountId, { ...created, ...dnsState });
 }
 
 // NOTE: 辅助函数 - 如果在环境变量中配置了 DEFAULT_API_KEY 和 DEFAULT_API_SECRET，自动进行初始化绑定
@@ -117,7 +167,9 @@ async function ensureDefaultAccount(c: any, dbManager: DatabaseManager) {
         // 深度同步一次域名，保证自动分类（已委派/已解析/未解析）
         try {
           const { client } = await dbManager.getClientForAccount(newAcc.id);
-          await deepSyncAccountDomains(dbManager, newAcc.id, client);
+          if (client instanceof DNSHEClient) {
+            await deepSyncAccountDomains(dbManager, newAcc.id, client);
+          }
         } catch (syncErr) {
           console.error("Default account auto-sync failed:", syncErr);
         }
@@ -133,33 +185,126 @@ type Variables = {
   db: DatabaseManager;
 };
 
+// ===== 登录失败限流常量 =====
+
+/** 同一「用户名@IP」或「IP」维度在窗口期内允许的连续失败次数，超限即锁定 */
+const LOGIN_MAX_FAILURES = 5;
+
+/** 限流窗口 / 锁定持续时长：15 分钟 */
+const LOGIN_LOCK_WINDOW_SECONDS = 15 * 60;
+
+const LOGIN_LOCKED_MESSAGE = "登录失败次数过多，账号已临时锁定，请 15 分钟后再试";
+
+// ===== 安全响应头 =====
+
+/**
+ * 统一的 Content-Security-Policy
+ *
+ * NOTE: 刻意不设 default-src —— 以免把 connect-src 收紧到 'self' 后，
+ * 设置页「后端地址覆盖」指向跨域 Worker 的功能失效。这里只收紧真正的注入面：
+ * 脚本只允许本站（内联脚本一律禁止，主题初始化因此移到外部 theme-init.js）、
+ * frame 一律禁嵌套（防点击劫持）、object/base 收紧。
+ */
+const CSP_VALUE = [
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline'",
+  "img-src 'self' data: https:",
+  "font-src 'self' data:",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "frame-ancestors 'none'",
+  "form-action 'self'",
+].join("; ");
+
+const SECURITY_HEADERS: Record<string, string> = {
+  "Content-Security-Policy": CSP_VALUE,
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "X-Content-Type-Options": "nosniff",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+};
+
+/** 给任意 Response 追加安全响应头（不修改原有 body / 状态） */
+function withSecurityHeaders(res: Response): Response {
+  const headers = new Headers(res.headers);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    headers.set(name, value);
+  }
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
+/**
+ * 提取客户端 IP（供登录限流分维度计数）
+ *
+ * Cloudflare 上优先取 cf-connecting-ip（由 CF 注入、不可伪造）；
+ * 自建版 / 反代场景回退到 x-real-ip / x-forwarded-for 的首个值。
+ */
+function getClientIp(c: Context<{ Bindings: Bindings; Variables: Variables }>): string {
+  const ip = (
+    c.req.header("cf-connecting-ip") ||
+    c.req.header("x-real-ip") ||
+    (c.req.header("x-forwarded-for") || "").split(",")[0] ||
+    "unknown"
+  ).trim();
+  return ip.slice(0, 64) || "unknown";
+}
+
+/**
+ * 把用户可控字符串截断到固定上限
+ *
+ * NOTE: 登录接口的 username 来自请求体、无长度约束，写日志与拼限流 key 前
+ * 必须截断，否则攻击者可用超长用户名刷爆 logs 表或撑大 cache 表。
+ */
+function capText(s: unknown, max = 64): string {
+  const v = String(s ?? "");
+  return v.length > max ? v.slice(0, max) : v;
+}
+
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 /**
  * CORS 中间件 — 默认仅允许同源访问，生产环境通过 ALLOWED_ORIGIN 环境变量配置
- * 
- * NOTE: 不再使用 origin: "*"，避免任意域名跨域调用管理 API
+ *
+ * ALLOWED_ORIGIN 支持逗号分隔的多个来源，便于前端同时挂在
+ * xxx.pages.dev 与自定义域名上（例："https://a.pages.dev,https://dnshe.example.com"）。
+ *
+ * NOTE: 预检与真实响应必须使用同一套判定逻辑，否则会出现「预检通过、真实请求被浏览器拦掉」
+ *       的 Failed to fetch 假故障。
  */
 app.use(
   "/api/*",
   async (c, next) => {
-    const origin = c.req.header("Origin") || "*";
-    
+    const requestOrigin = c.req.header("Origin") || "";
+
+    // 白名单为空 => 不限制来源（回显请求方 Origin）；非空 => 仅放行命中白名单的来源
+    const allowList = (c.env.ALLOWED_ORIGIN || "")
+      .split(",")
+      .map((o) => o.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+    const allowOrigin =
+      allowList.length === 0
+        ? requestOrigin || "*"
+        : allowList.includes(requestOrigin)
+        ? requestOrigin
+        : "";
+
     // 强制直接响应 CORS OPTIONS 预检请求，避免跨域报错
     if (c.req.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          "Access-Control-Allow-Origin": origin,
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Authorization",
-          "Access-Control-Max-Age": "86400",
-        },
-      });
+      const headers: Record<string, string> = {
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Access-Control-Max-Age": "86400",
+        Vary: "Origin",
+      };
+      // 来源不在白名单时不下发 Allow-Origin，让浏览器按跨域拦截处理
+      if (allowOrigin) {
+        headers["Access-Control-Allow-Origin"] = allowOrigin;
+      }
+      return new Response(null, { status: 204, headers });
     }
 
     const corsMiddleware = cors({
-      origin: c.env.ALLOWED_ORIGIN || origin,
+      origin: allowList.length > 0 ? allowList : requestOrigin || "*",
       allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
       allowHeaders: ["Content-Type", "Authorization"],
       maxAge: 86400,
@@ -301,11 +446,40 @@ async function verifyTOTP(token?: string, secretStr?: string): Promise<boolean> 
 }
 
 /**
+ * 表结构自举 — 每个 isolate 只执行一次
+ *
+ * NOTE: 这里原先是每个 /api/* 请求都 await dbManager.ensureTables()，
+ *       而 ensureTables 的成本是「5 条 CREATE TABLE 的 batch（写事务）+ 1 条 PRAGMA table_info」，
+ *       两次串行 D1 往返，实测给每个请求固定加上约 0.5s。
+ *       同一个部署内表结构不会变化，因此用模块级 Promise 缓存收敛为每 isolate 一次。
+ *       自举失败时不缓存，留给下一个请求重试，避免把一次偶发失败固化成永久跳过。
+ */
+let schemaReady: Promise<boolean> | null = null;
+
+function ensureSchemaOnce(dbManager: DatabaseManager): Promise<boolean> {
+  if (!schemaReady) {
+    schemaReady = dbManager
+      .ensureTables()
+      .then((ok) => {
+        if (!ok) schemaReady = null;
+        return ok;
+      })
+      .catch((e) => {
+        schemaReady = null;
+        console.error("ensureSchemaOnce failed:", e);
+        return false;
+      });
+  }
+  return schemaReady;
+}
+
+/**
  * DatabaseManager 实例化中间件 — 注入 dbManager 到 context
  */
 app.use("/api/*", async (c, next) => {
   const dbManager = new DatabaseManager(c.env.DB, c.env.AES_KEY);
-  await dbManager.ensureTables();
+  // 自举失败不阻塞请求：与改造前行为一致，交由后续真实查询暴露具体错误
+  await ensureSchemaOnce(dbManager);
   c.set("db", dbManager);
   return next();
 });
@@ -352,8 +526,7 @@ app.post("/api/auth/setup", async (c) => {
     await dbManager.writeLog("success", "auth", `系统完成首次初始化，已创建管理员账户 [${username}]`);
 
     // 初始化后直接签发 Session，免去再登录一次
-    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+    const sessionToken = await dbManager.createSession();
 
     return c.json(successRes({
       session_token: sessionToken,
@@ -379,9 +552,30 @@ app.post("/api/auth/login", async (c) => {
     const password = String(body.password || "");
     const totpToken = String(body.token || "").trim();
 
+    // 登录失败限流：按「用户名@IP」与「纯 IP」两个维度计数，任一超限即整体锁定，
+    // 防止对密码与 6 位 TOTP 的在线爆破（IP 维度顺带拦住轮换用户名/应急令牌的情况）。
+    const clientIp = getClientIp(c);
+    const userScope = `u:${capText(username)}@${clientIp}`;
+    const ipScope = `ip:${clientIp}`;
+    const isLocked = async (): Promise<boolean> =>
+      (await dbManager.countLoginFailures(userScope)) >= LOGIN_MAX_FAILURES ||
+      (await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES;
+    const noteFailure = async (): Promise<void> => {
+      await dbManager.recordLoginFailure(userScope, LOGIN_LOCK_WINDOW_SECONDS);
+      await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
+    };
+    const noteSuccess = async (): Promise<void> => {
+      await dbManager.clearLoginFailures(userScope);
+      await dbManager.clearLoginFailures(ipScope);
+    };
+
     // 尚未初始化：引导前端走首次设置流程
     if (!cfg.initialized) {
       return c.json(errorRes("系统尚未初始化，请先设置管理员账户与密码", "not_initialized"), 409);
+    }
+
+    if (await isLocked()) {
+      return c.json(errorRes(LOGIN_LOCKED_MESSAGE, "too_many_attempts"), 429);
     }
 
     // 应急令牌通道：单独用 ADMIN_TOKEN（静态或其 TOTP）直接登录，用于忘记密码时找回
@@ -389,14 +583,15 @@ app.post("/api/auth/login", async (c) => {
       const candidate = totpToken || password;
       const emgTotpValid = await verifyTOTP(candidate, emergencyToken);
       if (emgTotpValid || timingSafeEqual(candidate, emergencyToken)) {
-        const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-        await dbManager.setSetting(`sess_${sessionToken}`, "valid");
+        const sessionToken = await dbManager.createSession();
         await dbManager.writeLog("warning", "auth", "管理员通过应急令牌 (ADMIN_TOKEN) 登录");
         return c.json(successRes({
           session_token: sessionToken,
           message: "已通过应急令牌登录，建议尽快在设置中重置密码",
         }));
       }
+      // 应急令牌校验失败同样计入限流，避免对静态令牌 / 其 TOTP 的在线爆破
+      await noteFailure();
     }
 
     if (!username || !password) {
@@ -407,7 +602,8 @@ app.post("/api/auth/login", async (c) => {
     const userMatch = timingSafeEqual(username, cfg.username);
     const passMatch = await dbManager.verifyPassword(password);
     if (!userMatch || !passMatch) {
-      await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${username})`);
+      await dbManager.writeLog("warning", "auth", `管理员登录失败：用户名或密码错误 (输入用户名: ${capText(username)})`);
+      await noteFailure();
       return c.json(errorRes("用户名或密码错误", "invalid_credentials"), 401);
     }
 
@@ -420,14 +616,15 @@ app.post("/api/auth/login", async (c) => {
       const totpValid = await verifyTOTP(totpToken, cfg.twoFaSecret);
       if (!totpValid) {
         await dbManager.writeLog("warning", "auth", "管理员登录失败：2FA 动态验证码错误或已过期");
+        await noteFailure();
         return c.json(errorRes("2FA 动态验证码错误或已过期", "invalid_2fa"), 401);
       }
     }
 
-    // 3. 全部通过，签发长期 Session Token
-    const sessionToken = `dnshe_sess_${crypto.randomUUID()}`;
-    await dbManager.setSetting(`sess_${sessionToken}`, "valid");
-    await dbManager.writeLog("success", "auth", `管理员 [${username}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
+    // 3. 全部通过，签发 Session Token（有效期见 DatabaseManager.SESSION_TTL_SECONDS）
+    const sessionToken = await dbManager.createSession();
+    await noteSuccess();
+    await dbManager.writeLog("success", "auth", `管理员 [${capText(username)}] 登录成功${cfg.twoFaEnabled ? "（含 2FA 校验）" : ""}`);
 
     return c.json(successRes({
       session_token: sessionToken,
@@ -436,6 +633,25 @@ app.post("/api/auth/login", async (c) => {
   } catch (e: any) {
     console.error("Login process error:", e);
     return c.json(errorRes(`登录鉴权失败: ${e?.message || "服务端内部错误"}`), 500);
+  }
+});
+
+/**
+ * 0-d. 登出接口 — 服务端立即使当前 Bearer 会话失效（需已登录，走鉴权中间件）
+ */
+app.post("/api/auth/logout", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const authHeader = c.req.header("Authorization") || "";
+    const token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : "";
+    if (token) {
+      await dbManager.revokeSession(token);
+      await dbManager.writeLog("info", "auth", "管理员注销了当前登录会话");
+    }
+    return c.json(successRes({ message: "已退出登录" }));
+  } catch (e: any) {
+    console.error("Logout error:", e);
+    return c.json(errorRes(`注销失败: ${e?.message || "服务端内部错误"}`), 500);
   }
 });
 
@@ -460,11 +676,10 @@ app.use("/api/*", async (c, next) => {
   const dbManager = c.get("db");
   const emergencyToken = c.env.ADMIN_TOKEN || "";
 
-  // 1. 校验登录成功后签发的 Session Token
-  if (token.startsWith("dnshe_sess_")) {
+  // 1. 校验登录成功后签发的 Session Token（不存在或已过期均视为失效）
+  if (token.startsWith(DatabaseManager.SESSION_PREFIX)) {
     try {
-      const storedSess = await dbManager.getSetting(`sess_${token}`);
-      if (storedSess === "valid") {
+      if (await dbManager.validateSession(token)) {
         return next();
       }
     } catch (e) {}
@@ -475,6 +690,17 @@ app.use("/api/*", async (c, next) => {
     if (timingSafeEqual(token, emergencyToken) || await verifyTOTP(token, emergencyToken)) {
       return next();
     }
+  }
+
+  // 3. 全部失效。若请求带的是「非会话形状」的凭据（扫描器乱填 / 针对 ADMIN_TOKEN
+  //    的静态值或 TOTP 爆破），按 IP 计数并限流，避免应急通道成为无限尝试的旁路。
+  //    正常登录拿到的会话 token 都带 dnshe_sess_ 前缀，不受此维度影响。
+  if (!token.startsWith(DatabaseManager.SESSION_PREFIX)) {
+    const ipScope = `ip:${getClientIp(c)}`;
+    if ((await dbManager.countLoginFailures(ipScope)) >= LOGIN_MAX_FAILURES) {
+      return c.json(errorRes(LOGIN_LOCKED_MESSAGE, "too_many_attempts"), 429);
+    }
+    await dbManager.recordLoginFailure(ipScope, LOGIN_LOCK_WINDOW_SECONDS);
   }
 
   return c.json(errorRes("认证失败：会话凭据已失效，请重新登录", "forbidden"), 403);
@@ -628,22 +854,31 @@ app.get("/api/accounts", async (c) => {
   }
 });
 
-// 2. 绑定新账号（alias 可选，留空时自动从 API Key 解析密钥名称作为别名）
+// 2. 绑定新账号（DNSHE：API Key + Secret；Cloudflare：API Token。alias 可选，留空时自动解析）
 app.post("/api/accounts", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json();
-    const { alias, api_key, api_secret } = body;
-    
-    if (!api_key || !api_secret) {
-      return c.json(errorRes("参数缺失：api_key, api_secret 为必填项（alias 可选，留空将自动解析）", "bad_request"), 400);
+    const provider = body.provider === "cloudflare" ? "cloudflare" : "dnshe";
+    const { alias, api_key, api_secret, api_token } = body;
+
+    let newAccount;
+    if (provider === "cloudflare") {
+      if (!api_token) {
+        return c.json(errorRes("参数缺失：api_token 为必填项（Cloudflare API Token，alias 可选，留空将自动解析）", "bad_request"), 400);
+      }
+      // 绑定过程会先校验 Token（/user/tokens/verify），无效 Token 直接报错不入库
+      newAccount = await dbManager.addAccount(String(alias || "").trim(), "", String(api_token).trim(), "cloudflare");
+    } else {
+      if (!api_key || !api_secret) {
+        return c.json(errorRes("参数缺失：api_key, api_secret 为必填项（alias 可选，留空将自动解析）", "bad_request"), 400);
+      }
+      newAccount = await dbManager.addAccount(String(alias || "").trim(), String(api_key), String(api_secret));
     }
 
-    const newAccount = await dbManager.addAccount(String(alias || "").trim(), String(api_key), String(api_secret));
-    
     // 绑定成功后，后台深度同步该账号域名（逐个拉取 DNS 记录自动分类），不阻塞响应
     if (newAccount && newAccount.id) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [newAccount.id]));
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [newAccount.id]));
     }
 
     return c.json(successRes({ account: newAccount }));
@@ -653,14 +888,20 @@ app.post("/api/accounts", async (c) => {
   }
 });
 
-// 3. 批量绑定新账号（仅需 API Key + API Secret，别名留空自动解析）
+// 3. 批量绑定新账号（DNSHE：Key+Secret 每行一组；Cloudflare：api_token 每行一个）
 app.post("/api/accounts/batch", async (c) => {
   const dbManager = c.get("db");
   try {
     const body = await c.req.json().catch(() => ({}));
+    const provider = body.provider === "cloudflare" ? "cloudflare" : "dnshe";
     const items = Array.isArray(body.accounts) ? body.accounts : [];
     if (items.length === 0) {
-      return c.json(errorRes("请至少提供一条账号信息（api_key + api_secret）", "bad_request"), 400);
+      return c.json(errorRes(
+        provider === "cloudflare"
+          ? "请至少提供一条账号信息（api_token）"
+          : "请至少提供一条账号信息（api_key + api_secret）",
+        "bad_request"
+      ), 400);
     }
     if (items.length > 50) {
       return c.json(errorRes("单次最多批量绑定 50 个账号", "bad_request"), 400);
@@ -671,11 +912,34 @@ app.post("/api/accounts/batch", async (c) => {
     let successCount = 0;
     let failCount = 0;
 
-    // 串行处理每个账号，间隔 800ms 以规避 DNSHE 速率限制（默认 30-60 请求/分钟）
+    // 串行处理每个账号，间隔 800ms 以规避上游 API 速率限制
     for (const item of items) {
+      const alias = String(item?.alias || "").trim();
+
+      if (provider === "cloudflare") {
+        const apiToken = String(item?.api_token || "").trim();
+        if (!apiToken) {
+          failCount++;
+          results.push({ api_key: "(未填写)", success: false, message: "缺少 Cloudflare API Token" });
+          continue;
+        }
+
+        try {
+          const newAccount = await dbManager.addAccount(alias, "", apiToken, "cloudflare");
+          newAccountIds.push(newAccount.id);
+          successCount++;
+          results.push({ api_key: `${apiToken.slice(0, 4)}***`, alias: newAccount.alias, success: true, message: "绑定成功" });
+        } catch (e: unknown) {
+          failCount++;
+          const message = e instanceof Error ? e.message : "未知错误";
+          results.push({ api_key: `${apiToken.slice(0, 4)}***`, success: false, message });
+        }
+        await sleep(800);
+        continue;
+      }
+
       const apiKey = String(item?.api_key || "").trim();
       const apiSecret = String(item?.api_secret || "").trim();
-      const alias = String(item?.alias || "").trim();
 
       if (!apiKey || !apiSecret) {
         failCount++;
@@ -699,13 +963,15 @@ app.post("/api/accounts/batch", async (c) => {
 
     // 绑定完成后在后台逐个同步域名（间隔 1.2s 限频），不阻塞 HTTP 响应
     if (newAccountIds.length > 0) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, newAccountIds));
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, newAccountIds));
     }
 
     return c.json(successRes({
       success_count: successCount,
       fail_count: failCount,
       results,
+      // 前端据此轮询等待后台域名同步落库，绑定完不必手动刷新页面
+      account_ids: newAccountIds,
       message: `批量绑定完成：成功 ${successCount} 个，失败 ${failCount} 个，域名同步已在后台进行中`,
     }));
   } catch (e: unknown) {
@@ -714,7 +980,7 @@ app.post("/api/accounts/batch", async (c) => {
   }
 });
 
-// 4. 修改账号信息（可仅改别名，或同时更换 API Key/Secret）
+// 4. 修改账号信息（可仅改别名；DNSHE 可换 Key/Secret 对，Cloudflare 可换 Token）
 app.put("/api/accounts/:id", async (c) => {
   const dbManager = c.get("db");
   const id = parseInt(c.req.param("id"), 10);
@@ -722,13 +988,18 @@ app.put("/api/accounts/:id", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const alias = String(body.alias || "");
     const apiKey = body.api_key !== undefined ? String(body.api_key) : undefined;
+    // Cloudflare 的 Token 走 api_token 字段，与 DNSHE 的 api_secret 区分开
+    const apiToken = body.api_token !== undefined ? String(body.api_token).trim() : undefined;
     const apiSecret = body.api_secret !== undefined ? String(body.api_secret) : undefined;
 
-    const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiSecret);
+    const updatedAccount = await dbManager.updateAccount(id, alias, apiKey, apiToken ?? apiSecret);
 
-    // 若更换了 API Key，则后台深度重新同步该账号的域名缓存（拉取 DNS 记录自动分类）
-    if (apiKey && apiSecret) {
-      c.executionCtx.waitUntil(syncDomainsForAccounts(dbManager, [updatedAccount.id]));
+    // 若更换了凭据，则后台深度重新同步该账号的域名缓存；仅改别名时只需就地改掉配额缓存里的别名
+    const credentialsChanged = Boolean(apiToken) || Boolean(apiKey && apiSecret);
+    if (credentialsChanged) {
+      c.executionCtx.waitUntil(resyncAccountsInBackground(dbManager, [updatedAccount.id]));
+    } else {
+      await dbManager.renameAccountInQuotaCache(updatedAccount.id, updatedAccount.alias);
     }
 
     return c.json(successRes({ account: updatedAccount, message: "账号信息已更新" }));
@@ -743,6 +1014,9 @@ app.delete("/api/accounts/:id", async (c) => {
   const dbManager = c.get("db");
   const id = parseInt(c.req.param("id"), 10);
   try {
+    // 先摘掉配额缓存里的条目，否则「账户配额」页会一直列着已解绑的账号，
+    // 直到用户手动点「刷新」强制回源为止
+    await dbManager.removeAccountFromQuotaCache(id);
     await dbManager.deleteAccount(id);
     return c.json(successRes({ message: "账户解绑成功" }));
   } catch (e: unknown) {
@@ -756,15 +1030,20 @@ app.delete("/api/accounts/:id", async (c) => {
  */
 
 // 1. 跨账号列出所有域名
+//
+// NOTE: provider 查询参数 —— 传 "cloudflare" 时只返回 Cloudflare 账号的 zone（独立的
+// Cloudflare 标签页使用）；缺省时排除这些行，DNSHE 域名页的数据结构保持不变。
 app.get("/api/domains", async (c) => {
   const dbManager = c.get("db");
   const search = c.req.query("search") || "";
   const status = c.req.query("status") || "";
   const accountIdStr = c.req.query("account_id");
   const accountId = accountIdStr ? parseInt(accountIdStr, 10) : undefined;
+  const providerParam = c.req.query("provider");
+  const provider = providerParam === "cloudflare" || providerParam === "dnshe" ? providerParam : undefined;
 
   try {
-    const domains = await dbManager.getDomains(search, status, accountId);
+    const domains = await dbManager.getDomains(search, status, accountId, provider);
     return c.json(successRes({ domains }));
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : "未知错误";
@@ -777,7 +1056,7 @@ app.post("/api/domains/sync", async (c) => {
   const dbManager = c.get("db");
   try {
     // 异步执行同步以防止 HTTP 响应超时 (Cloudflare Worker 允许在 waitUntil 里跑异步)
-    const webhookType = (c.env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    const webhookType = (c.env.WEBHOOK_TYPE || "custom") as WebhookType;
     c.executionCtx.waitUntil(runDailySyncAndRenewal(dbManager, c.env.WEBHOOK_URL, webhookType));
     return c.json(successRes({ message: "域名同步后台任务已启动，请稍后刷新查看最新数据" }));
   } catch (e: unknown) {
@@ -799,7 +1078,11 @@ app.post("/api/domains/:id/renew", async (c) => {
     }
 
     const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
-    
+    // Cloudflare 域名的有效期由注册商管理，不存在 DNSHE 式续期
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("Cloudflare 域名不通过 DNSHE 续期，请在 Cloudflare 或对应注册商平台管理有效期", "not_supported"), 400);
+    }
+
     const res = await client.renewSubdomain(domainId);
     if (res && res.success) {
       const newExpiresAt = res.new_expires_at || "";
@@ -811,7 +1094,7 @@ app.post("/api/domains/:id/renew", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("续期后刷新配额缓存失败:", e);
@@ -909,6 +1192,11 @@ app.post("/api/domains/:id/delete", async (c) => {
 
     const { client, alias } = await dbManager.getClientForAccount(domainInfo.account_id);
 
+    // Cloudflare zone 不在本面板删除（危险操作，请前往 Cloudflare 控制台）
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("Cloudflare 域名不支持在本面板删除，请前往 Cloudflare 控制台操作", "delete_forbidden"), 409);
+    }
+
     // ── 防线二：解析记录历史检查 ──
     // 只要当前仍存在解析记录就直接拦截；"历史"记录无法从 API 读取，
     // 交由上游判定（失败时走 translateDeleteError 翻译）。
@@ -942,7 +1230,7 @@ app.post("/api/domains/:id/delete", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("删除后刷新配额缓存失败:", e);
@@ -988,8 +1276,10 @@ app.get("/api/domains/:id/dns", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.listDnsRecords(domainId);
-    
+    // DNSHE 行的 remote_id 为空，直接用主键 subdomain_id；Cloudflare 行用 zone id
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
+    const res = await client.listDnsRecords(remoteId);
+
     if (res && res.success) {
       const records = res.records || [];
       await dbManager.setCache(cacheKey, JSON.stringify(records));
@@ -1004,36 +1294,73 @@ app.get("/api/domains/:id/dns", async (c) => {
   }
 });
 
-// 辅助函数：DNS 记录变更后，自动重新计算并同步更新域名的三态 (已委派 / 已解析 / 未解析)
-async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient, domainId: number) {
-  try {
-    const dnsRes = await client.listDnsRecords(domainId);
-    const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
-    
-    // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
-    await dbManager.setCache(`api_cache:dns:${domainId}`, JSON.stringify(records));
-    
-    // 是否使用自定义/第三方 NS
-    const nsRecords = records.filter(r => r.type === "NS");
-    const hasCustomNs = nsRecords.length > 0;
-    
-    let computedStatus = "未解析";
-    let hasDns = 1;
-    
-    if (hasCustomNs) {
-      computedStatus = "已委派";
-      hasDns = 0;
-    } else if (records.length > 0) {
-      computedStatus = "已解析";
-      hasDns = 1;
-    } else {
-      computedStatus = "未解析";
-      hasDns = 1;
-    }
+/**
+ * 把主机记录规范化为上游要求的相对名
+ *
+ * NOTE: dns_records/list 读出来的 name 是**完整域名**（`ipv6.1.cd`），而写接口只接受
+ * `@` 或相对名，原样回填提交会被上游拒绝：
+ *   "record name must be @ or a relative record name; full domain names are not accepted"
+ * 所有写路径（创建 / 修改 / 批量创建）都过这里，前端传完整域名、带尾点、中文都能接住。
+ * 统一转成 ASCII 小写，与「中文域名统一转 xn-- 后送往上游」的既有约定一致。
+ */
+function normalizeDnsRecordName(rawName: string, fullDomain: string): string {
+  const trimmed = String(rawName || "").trim().replace(/\.+$/, "");
+  if (!trimmed || trimmed === "@") {
+    return "@";
+  }
 
-    await dbManager.updateDomainStatusAndDns(domainId, computedStatus, hasDns);
+  const name = toASCII(trimmed).toLowerCase();
+  const base = toASCII(String(fullDomain || "").trim()).toLowerCase().replace(/\.+$/, "");
+  if (!base) {
+    return name;
+  }
+  if (name === base) {
+    return "@";
+  }
+  if (name.endsWith(`.${base}`)) {
+    return name.slice(0, -(base.length + 1)) || "@";
+  }
+  return name;
+}
+
+/**
+ * DNS 写操作错误翻译
+ *
+ * NOTE: DNSHE 上游 API 在 disable_ns_management 开关禁用时，会直接拒绝 NS 类型
+ * 记录的写入并返回 403，此处翻译为更友好的中文提示。创建 / 修改 / 批量创建共用。
+ */
+function translateDnsWriteError(raw: string, type?: unknown): { message: string; errorCode: string } {
+  const isNsType = String(type || "").toUpperCase() === "NS";
+  const is403 = raw.includes("403") || raw.includes("Forbidden");
+  if (isNsType && is403) {
+    return {
+      message: "DNSHE 上游平台已禁用 NS 管理功能 (disable_ns_management)，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。",
+      errorCode: "ns_management_disabled",
+    };
+  }
+  return { message: raw, errorCode: "internal_error" };
+}
+
+// 辅助函数：DNS 记录变更后，自动重新计算并同步更新域名的三态 (已委派 / 已解析 / 未解析)
+async function syncDomainStatusAfterDnsChange(dbManager: DatabaseManager, client: DNSHEClient | CloudflareClient, domainInfo: DBDomain) {
+  try {
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainInfo.id;
+    const dnsRes = await client.listDnsRecords(remoteId);
+    const records = (dnsRes && dnsRes.success && Array.isArray(dnsRes.records)) ? dnsRes.records : [];
+
+    // 写操作回源后，将最新记录回填到缓存，后续读操作直接命中
+    await dbManager.setCache(`api_cache:dns:${domainInfo.id}`, JSON.stringify(records));
+
+    if (client instanceof CloudflareClient) {
+      // Cloudflare 托管的 zone：apex NS 记录必然指向 *.ns.cloudflare.com，computeDnsState
+      // 会把它误判成「已委派」。这些行由绑定的 CF 账号直接管理，固定写「已解析」。
+      await dbManager.updateDomainStatusAndDns(domainInfo.id, "已解析", 1, "Cloudflare");
+    } else {
+      const { status, has_dns, dns_provider } = computeDnsState(records);
+      await dbManager.updateDomainStatusAndDns(domainInfo.id, status, has_dns, dns_provider);
+    }
   } catch (e) {
-    console.error(`域名状态实时更新异常 [subdomain_id: ${domainId}]:`, e);
+    console.error(`域名状态实时更新异常 [domain_id: ${domainInfo.id}]:`, e);
   }
 }
 
@@ -1053,28 +1380,389 @@ app.post("/api/domains/:id/dns", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.createDnsRecord({
-      subdomain_id: domainId,
-      ...body
-    } as CreateDnsRecordParams);
+    // NOTE: 保留 ...body 透传（weight / port / target 等上游可选字段），只覆盖需要
+    // 规范化的主机记录；前端把列表里读到的完整域名填回来时也不会被上游拒绝。
+    const recordName = normalizeDnsRecordName(String(body.name ?? ""), domainInfo.full_domain);
+    let res;
+    if (client instanceof CloudflareClient) {
+      res = await client.createDnsRecord({
+        zone_id: String(domainInfo.remote_id || ""),
+        zone_name: domainInfo.full_domain,
+        type: String(body.type || ""),
+        name: recordName,
+        content: String(body.content ?? ""),
+        ttl: Number(body.ttl) > 0 ? Number(body.ttl) : undefined,
+        priority: Number.isFinite(Number(body.priority)) ? Number(body.priority) : undefined,
+        proxied: body.proxied === true || body.proxied === "true",
+      });
+    } else {
+      res = await client.createDnsRecord({
+        subdomain_id: domainId,
+        ...body,
+        name: recordName
+      } as CreateDnsRecordParams);
+    }
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${body.name || "@"} -> ${body.content}`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await dbManager.writeLog("success", "api", `在域名 [${domainInfo.full_domain}] 下创建了 [${body.type}] 记录: ${recordName} -> ${body.content}`);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "创建DNS记录成功", record: res.record }));
     } else {
       throw new Error(res.message || "创建DNS记录失败");
     }
   } catch (e: unknown) {
     const rawMsg = e instanceof Error ? e.message : "未知错误";
-    // NOTE: DNSHE 上游 API 在 disable_ns_management 开关禁用时，
-    // 会直接拒绝 NS 类型记录的写入并返回 403，此处翻译为更友好的中文提示
-    const isNsType = body.type === "NS";
-    const is403 = rawMsg.includes("403") || rawMsg.includes("Forbidden");
-    const message = (isNsType && is403)
-      ? "DNSHE 上游平台已禁用 NS 管理功能 (disable_ns_management)，无法通过 API 修改 NS 记录。请前往 DNSHE 官网后台手动设置。"
-      : rawMsg;
-    return c.json(errorRes(message, isNsType && is403 ? "ns_management_disabled" : "internal_error"), 400);
+    const { message, errorCode } = translateDnsWriteError(rawMsg, body.type);
+    return c.json(errorRes(message, errorCode), 400);
+  }
+});
+
+/** 批量写入 DNS 记录的单次上限（与上游 30-60 请求/分钟的限频折中） */
+const DNS_BATCH_LIMIT = 50;
+
+/** 批量写操作之间的间隔（毫秒），规避 DNSHE 上游限频 */
+const DNS_BATCH_INTERVAL = 300;
+
+/** 批量操作的单条结果 */
+interface DnsBatchItemResult {
+  label: string;
+  success: boolean;
+  message: string;
+}
+
+/**
+ * 把批量请求里的单条 item 规范化为提供商中立的上游写参数
+ *
+ * 类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发、线路留空则不带上。
+ * NOTE: 不再携带 subdomain_id / zone_id —— 调用方按账号提供商补齐各自的路由字段
+ * （DNSHE 加 subdomain_id，Cloudflare 加 zone_id + zone_name）。type / content 为空时
+ * 由调用方拒绝该条。
+ */
+function buildBatchDnsParams(
+  item: Record<string, unknown> | null | undefined,
+  fullDomain: string
+): { type: string; name: string; content: string; ttl: number; priority?: number; proxied?: boolean; params: Record<string, unknown> } {
+  const type = String(item?.type || "").trim().toUpperCase();
+  const name = normalizeDnsRecordName(String(item?.name ?? ""), fullDomain);
+  const content = String(item?.content || "").trim();
+
+  const ttl = Number(item?.ttl) > 0 ? Number(item?.ttl) : 600;
+  const params: Record<string, unknown> = {
+    type,
+    name,
+    content,
+    ttl,
+  };
+  let priority: number | undefined;
+  if ((type === "MX" || type === "SRV") && Number.isFinite(Number(item?.priority))) {
+    priority = Number(item?.priority);
+    params.priority = priority;
+  }
+  const line = String(item?.line || "").trim();
+  if (line) {
+    params.line = line;
+  }
+  // 橙色云代理开关（仅 Cloudflare 生效；DNSHE 上游会忽略未知字段）
+  const proxied = item?.proxied === true || item?.proxied === "true" ? true : undefined;
+  if (proxied) {
+    params.proxied = proxied;
+  }
+
+  return { type, name, content, ttl, priority, proxied, params };
+}
+
+// 5.1 批量新建 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+app.post("/api/domains/:id/dns/batch", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const items = Array.isArray(body.records) ? body.records : [];
+    if (items.length === 0) {
+      return c.json(errorRes("请至少提供一条解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量添加 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const cfZoneId = String(domainInfo.remote_id || "");
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const { type, name, content, ttl, priority, proxied, params } = buildBatchDnsParams(item, domainInfo.full_domain);
+      const label = `${type || "?"} ${name} → ${content || "(空)"}`;
+
+      if (!type || !content) {
+        failCount++;
+        results.push({ label, success: false, message: "记录类型与记录值均不能为空" });
+        continue;
+      }
+
+      try {
+        let res;
+        if (client instanceof CloudflareClient) {
+          res = await client.createDnsRecord({ zone_id: cfZoneId, zone_name: domainInfo.full_domain, type, name, content, ttl, priority, proxied });
+        } else {
+          res = await client.createDnsRecord({ ...params, subdomain_id: domainId } as unknown as CreateDnsRecordParams);
+        }
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "创建成功" });
+        } else {
+          throw new Error(res?.message || "创建DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        const { message, errorCode } = translateDnsWriteError(rawMsg, type);
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    // 只要有记录真的写进去了，就回源刷新缓存与三态（整批失败时不必多跑一次上游）
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量添加域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量添加完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量添加解析记录失败: ${message}`), 400);
+  }
+});
+
+// 5.2 批量修改 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+//
+// NOTE: 每条记录的字段由前端合并后整条送来（要改的字段用新值，不改的字段沿用原值），
+// 上游 update 接口本身也是整条覆盖语义，这里不做「部分字段」的猜测。
+app.post("/api/domains/:id/dns/batch-update", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const items = Array.isArray(body.records) ? body.records : [];
+    if (items.length === 0) {
+      return c.json(errorRes("请至少选择一条要修改的解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量修改 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const cfZoneId = String(domainInfo.remote_id || "");
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const { type, name, content, ttl, priority, proxied, params } = buildBatchDnsParams(item, domainInfo.full_domain);
+      const recordId = String(item?.record_id ?? item?.id ?? "").trim();
+      const label = String(item?.label || "").trim() || `${type || "?"} ${name} → ${content || "(空)"}`;
+
+      if (!recordId) {
+        failCount++;
+        results.push({ label, success: false, message: "缺少记录 ID，无法定位要修改的记录" });
+        continue;
+      }
+      if (!type || !content) {
+        failCount++;
+        results.push({ label, success: false, message: "记录类型与记录值均不能为空" });
+        continue;
+      }
+
+      try {
+        let res;
+        if (client instanceof CloudflareClient) {
+          res = await client.updateDnsRecord({ zone_id: cfZoneId, zone_name: domainInfo.full_domain, record_id: recordId, type, name, content, ttl, priority, proxied });
+        } else {
+          res = await client.updateDnsRecord({
+            ...params,
+            record_id: recordId,
+          } as unknown as UpdateDnsRecordParams);
+        }
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "修改成功" });
+        } else {
+          throw new Error(res?.message || "更新DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        const { message, errorCode } = translateDnsWriteError(rawMsg, type);
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量修改域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量修改完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量修改解析记录失败: ${message}`), 400);
+  }
+});
+
+// 5.3 批量删除 DNS 解析记录（串行提交，逐条返回结果，最后统一回源同步一次三态）
+app.post("/api/domains/:id/dns/batch-delete", async (c) => {
+  const dbManager = c.get("db");
+  const domainId = parseInt(c.req.param("id"), 10);
+
+  if (!Number.isInteger(domainId) || domainId <= 0) {
+    return c.json(errorRes("无效的域名 ID", "bad_request"), 400);
+  }
+
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const rawItems = Array.isArray(body.records) ? body.records : [];
+    // 兼容只传 ID 数组的调用：records 支持 [{record_id, label}] 或 ["123", 456]
+    const items = rawItems.map((it: unknown) => {
+      if (it !== null && typeof it === "object") {
+        const obj = it as Record<string, unknown>;
+        return {
+          recordId: String(obj.record_id ?? obj.id ?? "").trim(),
+          label: String(obj.label ?? obj.record_id ?? obj.id ?? "").trim(),
+        };
+      }
+      return { recordId: String(it ?? "").trim(), label: String(it ?? "").trim() };
+    }).filter((it: { recordId: string }) => it.recordId);
+
+    if (items.length === 0) {
+      return c.json(errorRes("请至少选择一条要删除的解析记录", "bad_request"), 400);
+    }
+    if (items.length > DNS_BATCH_LIMIT) {
+      return c.json(errorRes(`单次最多批量删除 ${DNS_BATCH_LIMIT} 条解析记录`, "bad_request"), 400);
+    }
+
+    const domainInfo = await dbManager.getDomainById(domainId);
+    if (!domainInfo) {
+      return c.json(errorRes("未找到域名记录", "not_found"), 404);
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
+
+    const results: DnsBatchItemResult[] = [];
+    let successCount = 0;
+    let failCount = 0;
+    let nsDisabled = false;
+    let changed = false;
+
+    for (const item of items) {
+      const label = item.label || item.recordId;
+      try {
+        const res = await client.deleteDnsRecord(remoteId, item.recordId);
+        if (res && res.success) {
+          successCount++;
+          changed = true;
+          results.push({ label, success: true, message: "删除成功" });
+        } else {
+          throw new Error(res?.message || "删除DNS记录失败");
+        }
+      } catch (e: unknown) {
+        failCount++;
+        const rawMsg = e instanceof Error ? e.message : "未知错误";
+        // 批量删除时无从得知记录类型，统一按 NS 判定 403（NS 被禁用是唯一会 403 的场景）
+        const { message, errorCode } = translateDnsWriteError(rawMsg, "NS");
+        if (errorCode === "ns_management_disabled") {
+          nsDisabled = true;
+        }
+        results.push({ label, success: false, message });
+      }
+
+      await sleep(DNS_BATCH_INTERVAL);
+    }
+
+    if (changed) {
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
+    }
+
+    await dbManager.writeLog(
+      failCount === 0 ? "success" : "warning",
+      "api",
+      `批量删除域名 [${domainInfo.full_domain}] 的解析记录完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+      results
+    );
+
+    return c.json(successRes({
+      success_count: successCount,
+      fail_count: failCount,
+      results,
+      error_code: nsDisabled ? "ns_management_disabled" : undefined,
+      message: `批量删除完成：成功 ${successCount} 条，失败 ${failCount} 条`,
+    }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(`批量删除解析记录失败: ${message}`), 400);
   }
 });
 
@@ -1083,32 +1771,76 @@ app.put("/api/domains/:id/dns/:record_id", async (c) => {
   const dbManager = c.get("db");
   const domainId = parseInt(c.req.param("id"), 10);
   const recordId = c.req.param("record_id");
+  // NOTE: body 声明在 try 外层，以便 catch 块能访问已解析的请求体
+  let body: Record<string, unknown> = {};
 
   try {
-    const body = await c.req.json();
+    body = await c.req.json();
     // NOTE: 使用主键查询替代全表扫描
     const domainInfo = await dbManager.getDomainById(domainId);
     if (!domainInfo) {
       return c.json(errorRes("未找到域名记录", "not_found"), 404);
     }
 
-    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.updateDnsRecord({
+    // 规范化提交字段：类型统一大写、主机记录转相对名、优先级只对 MX / SRV 下发
+    const type = String(body.type || "").trim().toUpperCase();
+    const content = String(body.content ?? "").trim();
+    if (!type || !content) {
+      return c.json(errorRes("记录类型与记录值均不能为空", "bad_request"), 400);
+    }
+
+    // NOTE: 先摊平 body 以透传 weight / port / target 等上游可选字段，再覆盖需要
+    // 规范化的字段；优先级与线路在不适用时显式删掉，避免把 A 记录的 priority 传上去。
+    const params: Record<string, unknown> = {
+      ...body,
       record_id: recordId,
       subdomain_id: domainId,
-      ...body
-    });
+      type,
+      name: normalizeDnsRecordName(String(body.name ?? ""), domainInfo.full_domain),
+      content,
+      ttl: Number(body.ttl) > 0 ? Number(body.ttl) : 600,
+    };
+    if ((type === "MX" || type === "SRV") && Number.isFinite(Number(body.priority))) {
+      params.priority = Number(body.priority);
+    } else {
+      delete params.priority;
+    }
+    const line = String(body.line || "").trim();
+    if (line) {
+      params.line = line;
+    } else {
+      delete params.line;
+    }
+
+    const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
+    let res;
+    if (client instanceof CloudflareClient) {
+      res = await client.updateDnsRecord({
+        zone_id: String(domainInfo.remote_id || ""),
+        zone_name: domainInfo.full_domain,
+        record_id: recordId,
+        type,
+        name: String(params.name),
+        content,
+        ttl: Number(params.ttl),
+        priority: Number.isFinite(Number(params.priority)) ? Number(params.priority) : undefined,
+        proxied: body.proxied === true || body.proxied === "true",
+      });
+    } else {
+      res = await client.updateDnsRecord(params as unknown as UpdateDnsRecordParams);
+    }
 
     if (res && res.success) {
-      await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${body.type} -> ${body.content}`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await dbManager.writeLog("success", "api", `修改了域名 [${domainInfo.full_domain}] 下的记录 (ID: ${recordId}): ${params.type} ${params.name} -> ${params.content}`);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "更新DNS记录成功" }));
     } else {
       throw new Error(res.message || "更新DNS记录失败");
     }
   } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "未知错误";
-    return c.json(errorRes(message), 400);
+    const rawMsg = e instanceof Error ? e.message : "未知错误";
+    const { message, errorCode } = translateDnsWriteError(rawMsg, body.type);
+    return c.json(errorRes(message, errorCode), 400);
   }
 });
 
@@ -1126,11 +1858,12 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(domainInfo.account_id);
-    const res = await client.deleteDnsRecord(domainId, recordId);
+    const remoteId = client instanceof CloudflareClient ? String(domainInfo.remote_id || "") : domainId;
+    const res = await client.deleteDnsRecord(remoteId, recordId);
 
     if (res && res.success) {
       await dbManager.writeLog("success", "api", `删除了域名 [${domainInfo.full_domain}] 下的 DNS 记录 (ID: ${recordId})`);
-      await syncDomainStatusAfterDnsChange(dbManager, client, domainId);
+      await syncDomainStatusAfterDnsChange(dbManager, client, domainInfo);
       return c.json(successRes({ message: "删除DNS记录成功" }));
     } else {
       throw new Error(res.message || "删除DNS记录失败");
@@ -1151,11 +1884,16 @@ app.delete("/api/domains/:id/dns/:record_id", async (c) => {
  * 辅助函数：并发拉取所有账号的配额并返回（不含缓存逻辑，供接口与写操作回填复用）
  */
 async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: Array<{ id: number; alias: string }>; quotas: any[] }> {
-  const accounts = await dbManager.getAccounts();
+  const allAccounts = await dbManager.getAccounts();
+  // Cloudflare 账号没有 DNSHE 式配额概念，跳过查询避免无意义的上游报错
+  const accounts = allAccounts.filter((acc) => acc.provider !== "cloudflare");
 
   // 并发发起所有账号的配额查询请求
   const quotaPromises = accounts.map(async (acc) => {
     const { client } = await dbManager.getClientForAccount(acc.id);
+    if (!(client instanceof DNSHEClient)) {
+      throw new Error("该账号不支持配额查询");
+    }
     const qRes = await client.getQuota();
     if (qRes && qRes.success) {
       return {
@@ -1185,7 +1923,7 @@ async function fetchAllQuotas(dbManager: DatabaseManager): Promise<{ accounts: A
 
 app.get("/api/quota", async (c) => {
   const dbManager = c.get("db");
-  const cacheKey = "api_cache:quota";
+  const cacheKey = QUOTA_CACHE_KEY;
   const forceRefresh = c.req.query("refresh") === "1";
 
   try {
@@ -1323,10 +2061,56 @@ app.post("/api/settings/test-telegram", async (c) => {
   }
 });
 
+// 4. 测试 Webhook 推送
+app.post("/api/settings/test-webhook", async (c) => {
+  const dbManager = c.get("db");
+  try {
+    const body = await c.req.json().catch(() => ({}));
+    const cfg = await dbManager.getAllAppSettings();
+    // 优先用请求体里传入的新值（用户可能还没保存），否则用库里已存的。
+    // webhook_url 是加密存储、读回前端时打了码，因此 **** 开头的值一律视为「沿用旧值」。
+    const url = (body.webhook_url && !String(body.webhook_url).startsWith("****"))
+      ? String(body.webhook_url).trim()
+      : String(cfg.webhook_url || "");
+    const type = String(body.webhook_type || cfg.webhook_type || "custom") as WebhookType;
+
+    if (!url) {
+      return c.json(errorRes(type === "serverchan" ? "请先填写 SendKey" : "请先填写 Webhook 地址", "bad_request"), 400);
+    }
+    // Server酱 允许只填 SendKey（由 normalizeServerChanEndpoint 补全），其余平台必须是完整地址
+    if (type !== "serverchan" && !/^https?:\/\//i.test(url)) {
+      return c.json(errorRes("Webhook 地址必须以 http:// 或 https:// 开头", "bad_request"), 400);
+    }
+
+    const result = await sendWebhookNotification(
+      url,
+      "🎉 DNSHE Manager 测试推送：Webhook 通知配置成功！",
+      type
+    );
+
+    if (!result.ok) {
+      // 把平台返回的原因透传给前端 —— 钉钉/飞书/企微的 token 失效都是 HTTP 200
+      // 里带错误码，不给出原文用户根本无从判断是 URL 错了还是类型选错了
+      let detail = result.detail || `推送失败（HTTP ${result.status ?? "?"}）`;
+
+      // NOTE: Server酱 最容易填错的是把控制台的「快速创建入口链接」当成推送地址
+      //（那是给用户创建 AppKey 的网页，POST 上去只会回一段 MethodNotAllowed XML）。
+      // 只填 SendKey 会被自动补全，所以这里只针对「填了 http 地址但不是推送端点」提示。
+      if (type === "serverchan" && /^https?:\/\//i.test(url) && !/\.send(\?|$)/i.test(url)) {
+        detail = `这个地址不像 Server酱 的推送端点（应以 .send 结尾）。直接把 SendKey 填进来即可，不要填控制台的「快速创建入口链接」。原始返回：${detail}`;
+      }
+      return c.json(errorRes(detail), 400);
+    }
+    return c.json(successRes({ message: "测试消息已发送，请检查对应的群/服务" }));
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "未知错误";
+    return c.json(errorRes(message), 400);
+  }
+});
+
 /**
  * 8. WHOIS 查询域名可注册性 (代理接口)
- */
-app.get("/api/whois", async (c) => {
+ */app.get("/api/whois", async (c) => {
   const domain = c.req.query("domain");
   const accountIdParam = c.req.query("account_id");
   if (!domain) {
@@ -1338,11 +2122,19 @@ app.get("/api/whois", async (c) => {
     let client: DNSHEClient;
     if (accountIdParam) {
       const auth = await dbManager.getClientForAccount(Number(accountIdParam));
+      if (!(auth.client instanceof DNSHEClient)) {
+        return c.json(errorRes("仅 DNSHE 账号支持 WHOIS 查重", "not_supported"), 400);
+      }
       client = auth.client;
     } else {
       const accounts = await dbManager.getAccounts();
-      if (accounts.length > 0) {
-        const auth = await dbManager.getClientForAccount(accounts[0].id);
+      // 优先取第一个 DNSHE 账号；Cloudflare 账号没有 WHOIS 代理能力
+      const dnsheAccount = accounts.find((acc) => acc.provider !== "cloudflare");
+      if (dnsheAccount) {
+        const auth = await dbManager.getClientForAccount(dnsheAccount.id);
+        if (!(auth.client instanceof DNSHEClient)) {
+          return c.json(errorRes("仅 DNSHE 账号支持 WHOIS 查重", "not_supported"), 400);
+        }
         client = auth.client;
       } else {
         client = new DNSHEClient("public", "public");
@@ -1428,6 +2220,267 @@ app.get("/api/whois/pool", async (c) => {
 });
 
 /**
+ * 8.6 查询根域名的 NS 记录（DoH 代理 + D1 缓存）
+ *
+ * 用途：判断「该根域下的子域名是否支持按线路（运营商/地域）解析」。上游 API 没有
+ * 任何线路能力字段，但根域的 NS 记录暴露了它实际托管在谁家 DNS 上 —— 挂阿里云
+ * (vip*.alidns.com) 的支持线路，挂 DNSHE 自建 NS (*.ns/nic.dnshe.org) 的不支持。
+ * 前端据此对照一份可编辑的 NS 后缀名单做判定（见 DNSHE_LINE_NS_SUFFIXES）。
+ *
+ * NOTE: 放在后端而不是前端直连 DoH，有三个理由：结论可进 D1 让所有设备共享；
+ * 不依赖用户本地网络能否访问 DoH 域名（大陆网络常被干扰）；与本项目「出站一律
+ * 走 Worker，结果落 D1 缓存」的既有模型一致。
+ */
+
+/**
+ * 公共 DoH 解析器（JSON API），按顺序尝试；三家返回同一 JSON 形状
+ *
+ * NOTE: 前两家在 Cloudflare 上必通，但自建（Docker）版跑在用户自己的网络里，
+ * 大陆环境下 cloudflare-dns.com 与 dns.google 基本不可用，因此补一个国内可达的
+ * 兜底解析器。顺序不变 —— Worker 上第一家就命中，第三家永远不会被访问到。
+ */
+const DOH_ENDPOINTS = [
+  "https://cloudflare-dns.com/dns-query",
+  "https://dns.google/resolve",
+  "https://dns.alidns.com/resolve"
+];
+
+/**
+ * 单次 DoH 查询超时
+ *
+ * NOTE: 被墙的解析器多数表现为「连上不回包」而不是立刻拒绝，没有超时的话
+ * 请求会一直挂着、根本走不到下一家。结论会缓存 30 天，这点等待只付一次。
+ */
+const DOH_TIMEOUT_MS = 5000;
+
+/** NS 结论缓存 30 天 —— NS 极少变动，但仍给一个到期时间以便厂商换 DNS 后能自愈 */
+const NS_CACHE_TTL = 30 * 24 * 3600;
+
+/** 单次请求最多查询的根域数（每个最坏 2 次子请求，Workers 单请求 50 subrequest 上限） */
+const NS_MAX_ROOTS = 20;
+
+/** DoH JSON 响应（RFC 8427 风格，Cloudflare / Google 通用） */
+interface DohResponse {
+  Status?: number;
+  Answer?: Array<{ name?: string; type?: number; data?: string }>;
+  Authority?: Array<{ name?: string; type?: number; data?: string }>;
+}
+
+/**
+ * 向公共 DoH 查询单个域名的 NS 记录
+ *
+ * @returns NS 主机名数组（已去尾点/转小写/去重/排序）；查询失败或无 NS 时返回 null，
+ *          调用方据此区分「不支持线路」与「未知」——后者不写缓存，下次再试。
+ */
+async function resolveNsViaDoh(name: string): Promise<string[] | null> {
+  for (const endpoint of DOH_ENDPOINTS) {
+    try {
+      const res = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=NS`, {
+        headers: { accept: "application/dns-json" },
+        signal: AbortSignal.timeout(DOH_TIMEOUT_MS)
+      });
+      if (!res.ok) continue;
+
+      const data = (await res.json()) as DohResponse;
+      // NOTE: 权威区自己应答时 NS 在 Answer；若该名字是从父区委派下来的，
+      //       记录会出现在 Authority 段，两处都要看。type 2 = NS。
+      const sections = [data.Answer, data.Authority];
+      for (const section of sections) {
+        const hosts = (section || [])
+          .filter((r) => r.type === 2 && r.data)
+          .map((r) => String(r.data).trim().toLowerCase().replace(/\.$/, ""))
+          .filter(Boolean);
+        if (hosts.length > 0) {
+          return Array.from(new Set(hosts)).sort();
+        }
+      }
+      // 该解析器答成功但没给 NS（NXDOMAIN 等），换下一家没有意义
+      if (data.Status === 0 || data.Status === 3) return null;
+    } catch (e: unknown) {
+      // NOTE: 自建版在大陆网络下前两家必然失败（重置或超时），是预期路径而非故障。
+      // 这里只记一行原因，不打整个堆栈，否则 docker compose logs 会被刷得没法看。
+      const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      console.error(`DoH NS 查询失败 [${endpoint}] [${name}]: ${reason}`);
+    }
+  }
+  return null;
+}
+
+app.get("/api/dns/ns", async (c) => {
+  const dbManager = c.get("db");
+  const rootsParam = c.req.query("roots");
+  const forceRefresh = c.req.query("refresh") === "1";
+
+  if (!rootsParam) {
+    return c.json(errorRes("必须提供 roots 参数（逗号分隔的根域名）", "bad_request"), 400);
+  }
+
+  // 去重后截断到上限：超出部分静默丢弃，前端本来就分批请求
+  const roots = Array.from(
+    new Set(
+      rootsParam
+        .split(",")
+        .map((r) => toASCII(String(r || "").trim().toLowerCase()))
+        .filter(Boolean)
+    )
+  ).slice(0, NS_MAX_ROOTS);
+
+  if (roots.length === 0) {
+    return c.json(successRes({ ns: {} }));
+  }
+
+  const ns: Record<string, string[] | null> = {};
+  let queried = 0;
+  let failed = 0;
+
+  await Promise.all(
+    roots.map(async (root) => {
+      const cacheKey = `ns:${root}`;
+      if (!forceRefresh) {
+        const cached = await dbManager.getCache(cacheKey);
+        if (cached) {
+          try {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              ns[root] = parsed.map((h: unknown) => String(h));
+              return;
+            }
+          } catch (e) {
+            // 缓存脏了当未命中处理，下面回源覆盖
+          }
+        }
+      }
+
+      queried++;
+      const hosts = await resolveNsViaDoh(root);
+      ns[root] = hosts;
+      if (hosts && hosts.length > 0) {
+        // 只缓存有效结论：查询失败不落库，避免把一次网络抖动固化成 30 天的「未知」
+        await dbManager.setCache(cacheKey, JSON.stringify(hosts), NS_CACHE_TTL);
+      } else {
+        failed++;
+      }
+    })
+  );
+
+  // 回源的全军覆没才值得留痕（通常是 Worker 出站被墙或两家 DoH 同时故障）；
+  // 个别根域查不到只体现在响应里，不刷日志。
+  if (queried > 0 && failed === queried) {
+    await dbManager.writeLog(
+      "warning",
+      "system",
+      `根域 NS 查询全部失败（${queried} 个），线路支持判定将回退到 provider_account_id`,
+      { roots, endpoints: DOH_ENDPOINTS }
+    );
+  }
+
+  return c.json(successRes({ ns }));
+});
+
+/**
+ * RDAP 查询域名在注册商侧的到期时间
+ *
+ * NOTE: Cloudflare 的 zone 对象没有到期字段（有效期登记在注册商处）。rdap.org 是
+ * IANA 的公共 RDAP 重定向入口，按 TLD 302 到对应注册局的 RDAP 服务，无需任何凭据。
+ * 结果写入 D1 缓存 7 天：到期时间以年为单位变化，没有更细粒度拉取的意义；
+ * 查不到（404，常见于 zone 是别人根域的子域）同样落缓存避免反复打上游，查询失败不落。
+ */
+const RDAP_CACHE_TTL = 7 * 24 * 3600;
+
+interface RdapEvent {
+  eventAction?: string;
+  eventDate?: string;
+}
+
+interface RdapExpiryResult {
+  found: boolean;
+  expires_at?: string;
+  registered_at?: string;
+  error?: string;
+}
+
+async function fetchExpiryViaRdap(domain: string): Promise<RdapExpiryResult> {
+  const res = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+    headers: { accept: "application/rdap+json" }
+  });
+  // 404 = 该名字不是可注册域名（多为子域 zone）或注册局无此记录
+  if (res.status === 404) {
+    return { found: false };
+  }
+  if (!res.ok) {
+    throw new Error(`RDAP HTTP ${res.status}`);
+  }
+  const data = (await res.json()) as { events?: RdapEvent[] };
+  const eventDate = (action: string) =>
+    (data.events || []).find((e) => e.eventAction === action)?.eventDate || "";
+  return {
+    found: true,
+    expires_at: eventDate("expiration") || undefined,
+    registered_at: eventDate("registration") || undefined
+  };
+}
+
+// GET /api/expiry?domains=a.com,b.com — 批量查询域名注册商侧到期时间（RDAP，7 天缓存）
+app.get("/api/expiry", async (c) => {
+  const dbManager = c.get("db");
+  const domains = Array.from(
+    new Set(
+      (c.req.query("domains") || "")
+        .split(",")
+        .map((d) => toASCII(String(d || "").trim().toLowerCase()))
+        .filter(Boolean)
+    )
+  ).slice(0, 50);
+
+  if (domains.length === 0) {
+    return c.json(successRes({ expiry: {} }));
+  }
+
+  const expiry: Record<string, RdapExpiryResult> = {};
+  const toQuery: string[] = [];
+
+  // 1. 先命中 D1 缓存
+  for (const d of domains) {
+    const cached = await dbManager.getCache(`rdap:${d}`);
+    if (cached) {
+      try {
+        expiry[d] = JSON.parse(cached) as RdapExpiryResult;
+        continue;
+      } catch {
+        // 缓存脏了按未命中处理
+      }
+    }
+    toQuery.push(d);
+  }
+
+  // 2. 未命中的并发回源（不同 TLD 落在不同注册局的 RDAP 服务，压力天然分散）。
+  //    错误在任务内部就地捕获：查询失败不落缓存（下次请求重试），其余结果（含 404）落 7 天缓存。
+  const settled = await Promise.allSettled(
+    toQuery.map((d) =>
+      fetchExpiryViaRdap(d)
+        .then(async (result) => {
+          await dbManager.setCache(`rdap:${d}`, JSON.stringify(result), RDAP_CACHE_TTL);
+          return { d, result };
+        })
+        .catch((err: unknown) => ({
+          d,
+          result: {
+            found: false,
+            error: err instanceof Error ? err.message : "查询失败"
+          } as RdapExpiryResult
+        }))
+    )
+  );
+  for (const item of settled) {
+    if (item.status === "fulfilled") {
+      expiry[item.value.d] = item.value.result;
+    }
+  }
+
+  return c.json(successRes({ expiry }));
+});
+
+/**
  * 9. 在线注册新子域名 (代理接口)
  */
 app.post("/api/domains/register", async (c) => {
@@ -1440,6 +2493,10 @@ app.post("/api/domains/register", async (c) => {
     }
 
     const { client } = await dbManager.getClientForAccount(account_id);
+    // 在线注册是 DNSHE 免费子域名专属能力
+    if (!(client instanceof DNSHEClient)) {
+      return c.json(errorRes("仅 DNSHE 账号支持在线注册子域名", "not_supported"), 400);
+    }
     // 中文等非 ASCII 域名统一转 Punycode (xn--) 后再送往上游 DNSHE API
     const asciiSub = toASCII(String(subdomain).trim());
     const asciiRoot = toASCII(String(rootdomain).trim());
@@ -1452,16 +2509,17 @@ app.post("/api/domains/register", async (c) => {
       try {
         const { accounts, quotas } = await fetchAllQuotas(dbManager);
         if (accounts.length > 0) {
-          await dbManager.setCache("api_cache:quota", JSON.stringify(quotas));
+          await dbManager.setCache(QUOTA_CACHE_KEY, JSON.stringify(quotas));
         }
       } catch (e) {
         console.error("注册后刷新配额缓存失败:", e);
       }
       
-      // 触发一次账号全量同步，把新注册域名自动拉入 domains_cache 数据库
+      // 只把新注册的这一个域名拉入 domains_cache
+      // NOTE: 不能在这里做账号级别的全量同步 —— subdomains/list 不返回解析记录，
+      // 会把该账号下所有域名的三态刷成「已解析 + 系统默认」，必须重新「同步所有账号」才能恢复。
       try {
-        const subdomains = await fetchAllSubdomainsFromClient(client);
-        await dbManager.syncAccountDomains(account_id, subdomains);
+        await cacheNewlyRegisteredDomain(dbManager, client, account_id, res.subdomain_id, fullDomain);
       } catch (e) {
         console.error("注册后同步错误:", e);
       }
@@ -1478,14 +2536,21 @@ app.post("/api/domains/register", async (c) => {
 
 /**
  * 导出 Worker 入口
+ *
+ * NOTE: fetch 出口统一包一层 withSecurityHeaders —— API 响应由这里补安全头；
+ * 静态资源（HTML/JS/CSS）在 Cloudflare 侧由 assets 的 _headers 下发
+ * （见 frontend/public/_headers），在自建版侧由 server/static.ts 下发。
  */
 export default {
-  fetch: app.fetch,
-  
+  async fetch(request: Request, env: Bindings, ctx: ExecutionContext): Promise<Response> {
+    const res = await app.fetch(request, env, ctx);
+    return withSecurityHeaders(res);
+  },
+
   // 处理 scheduled 定时任务 (Cron Trigger)
   async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
     const dbManager = new DatabaseManager(env.DB, env.AES_KEY);
-    const webhookType = (env.WEBHOOK_TYPE || "custom") as "dingtalk" | "feishu" | "wecom" | "custom";
+    const webhookType = (env.WEBHOOK_TYPE || "custom") as WebhookType;
     // 使用 ctx.waitUntil 保证 Worker 不会在异步任务未结束时被回收
     ctx.waitUntil(runDailySyncAndRenewal(dbManager, env.WEBHOOK_URL, webhookType));
   }
